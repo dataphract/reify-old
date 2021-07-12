@@ -1,6 +1,4 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-
-use ash::vk;
+use raw_window_handle::HasRawWindowHandle;
 use reify::Instance;
 use winit::{
     event_loop::{ControlFlow, EventLoop},
@@ -11,15 +9,13 @@ pub fn main() {
     env_logger::init();
 
     let event_loop = EventLoop::new();
-
-    let _window = WindowBuilder::new().build(&event_loop).unwrap();
+    let window = WindowBuilder::new().build(&event_loop).unwrap();
 
     let instance = Instance::create("reify", 0);
-
-    let debug_messenger = instance.create_debug_messenger();
-
+    let _debug_messenger = instance.create_debug_messenger();
+    let surface = instance.create_surface(window.raw_window_handle());
     let phys_device = match instance
-        .enumerate_physical_devices()
+        .enumerate_physical_devices(&surface)
         .into_iter()
         .find(|_phys| true)
     {

@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use arrayvec::ArrayVec;
 use ash::{
     extensions::{ext, khr},
     version::{DeviceV1_0, EntryV1_0, InstanceV1_0, InstanceV1_1},
@@ -16,6 +17,7 @@ use ash::{
 use parking_lot::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
+use raw_window_handle::RawWindowHandle;
 
 use crate::debug_utils::DebugMessenger;
 
@@ -112,7 +114,7 @@ struct InstanceInner {
 
     // Loaded dynamic library. Must be dropped *after* all Vulkan API calls have
     // completed.
-    _entry: ash::Entry,
+    entry: ash::Entry,
 }
 
 #[derive(Clone)]
@@ -243,10 +245,12 @@ impl Instance {
         let get_physical_device_properties = if driver_api_version >= ApiVersion::V1_1_0 {
             ExtensionFn::Core
         } else {
-            let ext = extensions
+            if !extensions
                 .iter()
-                .find(|&&ext| ext == vk::KhrGetPhysicalDeviceProperties2Fn::name())
-                .expect("missing required extension: VK_KHR_get_physical_device_properties2");
+                .any(|&ext| ext == vk::KhrGetPhysicalDeviceProperties2Fn::name())
+            {
+                panic!("missing required extension: VK_KHR_get_physical_device_properties2");
+            }
 
             let load_fn = |name: &CStr| unsafe {
                 let addr = entry.get_instance_proc_addr(raw_instance.handle(), name.as_ptr());
@@ -259,10 +263,12 @@ impl Instance {
         let external_memory_capabilities = if driver_api_version >= ApiVersion::V1_1_0 {
             ExtensionFn::Core
         } else {
-            let ext = extensions
+            if !extensions
                 .iter()
-                .find(|&&ext| ext == vk::KhrExternalMemoryCapabilitiesFn::name())
-                .expect("missing required extension: VK_KHR_external_memory_capabilities");
+                .any(|&ext| ext == vk::KhrExternalMemoryCapabilitiesFn::name())
+            {
+                panic!("missing required extension: VK_KHR_external_memory_capabilities");
+            }
 
             let load_fn = |name: &CStr| unsafe {
                 let addr = entry.get_instance_proc_addr(raw_instance.handle(), name.as_ptr());
@@ -292,7 +298,7 @@ impl Instance {
             display,
             debug_utils,
             raw: raw_instance,
-            _entry: entry,
+            entry,
         };
 
         Instance {
@@ -347,7 +353,61 @@ impl Instance {
         DebugMessenger::new(self.clone())
     }
 
-    pub fn enumerate_physical_devices(&self) -> Vec<PhysicalDevice> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    pub fn create_surface(&self, window: RawWindowHandle) -> Surface {
+        let inner = self.inner.read();
+
+        let raw = match window {
+            RawWindowHandle::Xlib(xlib) => {
+                let xlib_ext = khr::XlibSurface::new(&inner.entry, &*inner.raw);
+                let create_info = vk::XlibSurfaceCreateInfoKHR::builder()
+                    .flags(vk::XlibSurfaceCreateFlagsKHR::empty())
+                    .dpy(xlib.display as *mut _)
+                    .window(xlib.window);
+
+                unsafe { xlib_ext.create_xlib_surface(&create_info, None) }
+                    .expect("failed to create Xlib window surface")
+            }
+            RawWindowHandle::Xcb(xcb) => {
+                let xcb_ext = khr::XcbSurface::new(&inner.entry, &*inner.raw);
+                let create_info = vk::XcbSurfaceCreateInfoKHR::builder()
+                    .flags(vk::XcbSurfaceCreateFlagsKHR::empty())
+                    .window(xcb.window)
+                    .connection(xcb.connection);
+
+                unsafe { xcb_ext.create_xcb_surface(&create_info, None) }
+                    .expect("failed to create XCB window surface")
+            }
+            RawWindowHandle::Wayland(_) => todo!(),
+            _ => panic!("unrecognized window handle"),
+        };
+
+        Surface {
+            inner: Arc::new(RwLock::new(SurfaceInner {
+                instance: self.clone(),
+                raw,
+            })),
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    )))]
+    pub fn create_surface(&self, window: RawWindowHandle) -> () {
+        compile_error!("Unsupported platform (only linux is supported).");
+    }
+
+    pub fn enumerate_physical_devices(&self, surface: &Surface) -> Vec<PhysicalDevice> {
         let inner = self.inner.read();
 
         // Safety: Instance is externally synchronized by locking.
@@ -366,7 +426,7 @@ impl Instance {
             .into_iter()
             .map(|raw| {
                 // Safety: Physical device handle comes from the correct instance.
-                unsafe { PhysicalDevice::new(self.clone(), raw) }
+                unsafe { PhysicalDevice::new(self.clone(), raw, surface.inner.read().raw) }
             })
             .collect()
     }
@@ -378,6 +438,7 @@ pub struct PhysicalDeviceInner {
     queue_families: Vec<vk::QueueFamilyProperties>,
     graphics_queue_family: u32,
     transfer_queue_family: u32,
+    present_queue_family: u32,
 }
 
 fn is_dedicated_transfer(props: &vk::QueueFamilyProperties) -> bool {
@@ -404,7 +465,11 @@ impl PhysicalDevice {
     /// # Safety
     ///
     /// The raw physical device handle must have been provided by `instance`.
-    unsafe fn new(instance: Instance, raw: vk::PhysicalDevice) -> PhysicalDevice {
+    unsafe fn new(
+        instance: Instance,
+        raw: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> PhysicalDevice {
         // Safety: raw instance handle is not copied out of the guard.
         let queue_families = unsafe {
             instance
@@ -419,6 +484,12 @@ impl PhysicalDevice {
 
         let mut graphics_queue = None;
         let mut transfer_queue = None;
+        let mut present_queue = None;
+
+        let surface_ext = {
+            let instance = instance.inner.read();
+            khr::Surface::new(&instance.entry, &*instance.raw)
+        };
 
         for (index, qf) in queue_families.iter().enumerate() {
             match graphics_queue {
@@ -458,6 +529,20 @@ impl PhysicalDevice {
                     }
                 }
             }
+
+            // Safety:
+            // - Queue family index provided by physical device.
+            // - No external synchronization requirement.
+            if unsafe {
+                surface_ext
+                    .get_physical_device_surface_support(raw, index as u32, surface)
+                    .expect(&format!(
+                        "failed to query queue family {} for surface support",
+                        index
+                    ))
+            } {
+                present_queue = Some(index);
+            }
         }
 
         let graphics_queue_family = match graphics_queue {
@@ -490,6 +575,14 @@ impl PhysicalDevice {
             None => panic!("No queue families support transfer operations."),
         };
 
+        let present_queue_family = match present_queue {
+            Some(p) => {
+                log::info!("Using queue family {} for presentation", p);
+                p as u32
+            }
+            None => panic!("No queue families support presenting to the window surface"),
+        };
+
         PhysicalDevice {
             inner: Arc::new(PhysicalDeviceInner {
                 instance,
@@ -497,6 +590,7 @@ impl PhysicalDevice {
                 queue_families,
                 graphics_queue_family,
                 transfer_queue_family,
+                present_queue_family,
             }),
         }
     }
@@ -536,30 +630,41 @@ impl PhysicalDevice {
         self.inner.instance.clone()
     }
 
+    // Graphics, compute, transfer, present
+    const MAX_NEEDED_QUEUE_FAMILIES: usize = 4;
+
     pub fn create_device(&self) -> Device {
-        let graphics_queue_create_info = vk::DeviceQueueCreateInfo::builder()
-            .flags(vk::DeviceQueueCreateFlags::empty())
-            .queue_family_index(self.inner.graphics_queue_family)
-            .queue_priorities(&[1.0]);
+        let mut unique_queue_families: ArrayVec<u32, { Self::MAX_NEEDED_QUEUE_FAMILIES }> =
+            ArrayVec::new();
+        for family in [
+            self.inner.graphics_queue_family,
+            self.inner.transfer_queue_family,
+            self.inner.present_queue_family,
+        ] {
+            if !unique_queue_families.contains(&family) {
+                unique_queue_families.push(family);
+            }
+        }
 
-        let transfer_queue_create_info = vk::DeviceQueueCreateInfo::builder()
-            .flags(vk::DeviceQueueCreateFlags::empty())
-            .queue_family_index(self.inner.transfer_queue_family)
-            .queue_priorities(&[1.0]);
-
-        let graphics_queue_index = 0;
-        let transfer_queue_index = 1;
-        let queue_create_infos = &[
-            graphics_queue_create_info.build(),
-            transfer_queue_create_info.build(),
-        ];
+        let queue_create_infos: ArrayVec<
+            vk::DeviceQueueCreateInfo,
+            { Self::MAX_NEEDED_QUEUE_FAMILIES },
+        > = unique_queue_families
+            .iter()
+            .map(|qf| {
+                vk::DeviceQueueCreateInfo::builder()
+                    .flags(vk::DeviceQueueCreateFlags::empty())
+                    .queue_family_index(*qf)
+                    .queue_priorities(&[1.0])
+                    .build()
+            })
+            .collect();
 
         let phys_device_features = vk::PhysicalDeviceFeatures::builder();
-
         let enabled_layer_names = &[LAYER_NAME_VALIDATION.as_ptr() as *const i8];
         let device_create_info = vk::DeviceCreateInfo::builder()
             .flags(vk::DeviceCreateFlags::empty())
-            .queue_create_infos(queue_create_infos)
+            .queue_create_infos(&queue_create_infos)
             .enabled_layer_names(enabled_layer_names)
             .enabled_extension_names(&[])
             .enabled_features(&phys_device_features);
@@ -610,14 +715,15 @@ pub struct Device {
 }
 
 impl Device {
-    pub fn graphics_queue(&self) -> Queue {
-        let family = self.inner.phys_device.inner.graphics_queue_family;
-
-        // Safety:
-        // - Queue family index was specified at construction.
-        // - Queue index is less than the number of requested queues.
-        // - Queue flags were empty at device creation.
-        let raw = unsafe { self.inner.raw.get_device_queue(family, 0) };
+    /// Returns a queue owned by the logical device.
+    ///
+    /// # Safety
+    ///
+    /// - The family index must have been specified at logical device creation.
+    /// - The queue index must be less than the number of queues requested at
+    ///   logical device creation.
+    unsafe fn owned_queue(&self, family: u32, queue: u32) -> Queue {
+        let raw = unsafe { self.inner.raw.get_device_queue(family, queue) };
 
         Queue {
             inner: Arc::new(RwLock::new(QueueInner {
@@ -626,13 +732,57 @@ impl Device {
             })),
         }
     }
+
+    pub fn graphics_queue(&self) -> Queue {
+        let family = self.inner.phys_device.inner.graphics_queue_family;
+
+        // Safety:
+        // - Queue family index was specified at construction.
+        // - Queue index is less than the number of requested queues.
+        // - Queue flags were empty at device creation.
+        unsafe { self.owned_queue(family, 0) }
+    }
+
+    pub fn present_queue(&self) -> Queue {
+        let family = self.inner.phys_device.inner.present_queue_family;
+
+        // Safety:
+        // - Queue family index was specified at construction.
+        // - Queue index is less than the number of requested queues.
+        // - Queue flags were empty at device creation.
+        unsafe { self.owned_queue(family, 0) }
+    }
 }
 
-pub struct QueueInner {
+struct QueueInner {
     device: Device,
     raw: vk::Queue,
 }
 
 pub struct Queue {
     inner: Arc<RwLock<QueueInner>>,
+}
+
+struct SurfaceInner {
+    instance: Instance,
+    raw: vk::SurfaceKHR,
+}
+
+impl Drop for SurfaceInner {
+    fn drop(&mut self) {
+        let instance = self.instance.inner.read();
+
+        // Safety:
+        // - Swapchain objects have handles to this surface, so it will not be
+        //   dropped before they are.
+        // - Host access synchronization guaranteed by mutable receiver.
+        unsafe {
+            let surface_ext = khr::Surface::new(&instance.entry, &*instance.raw);
+            surface_ext.destroy_surface(self.raw, None);
+        }
+    }
+}
+
+pub struct Surface {
+    inner: Arc<RwLock<SurfaceInner>>,
 }
