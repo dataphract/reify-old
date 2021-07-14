@@ -1,12 +1,13 @@
 use std::{
     ffi::CStr,
     fmt::{self, Write},
+    sync::Arc,
 };
 
 use ash::{extensions::ext, vk};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
-use crate::Instance;
+use crate::{vks, Instance, VkSyncObject};
 
 fn format_cstr<F, C>(f: &mut F, cstr: C) -> fmt::Result
 where
@@ -216,19 +217,16 @@ fn debug_utils_messenger_callback_impl(
 
 pub struct DebugMessenger {
     instance: Instance,
-    messenger: vk::DebugUtilsMessengerEXT,
+    messenger: vks::DebugMessenger,
 }
 
 impl Drop for DebugMessenger {
     fn drop(&mut self) {
-        // Safety:
-        // - The messenger is externally synchronized, as it may only be dropped once.
-        // - This type does not expose the raw messenger handle in a way that
-        //   would allow it to be used on multiple threads at once.
         unsafe {
             self.instance
-                .write_ext_debug_utils_raw()
-                .destroy_debug_utils_messenger(self.messenger, None);
+                .read_inner()
+                .handle()
+                .destroy_debug_utils_messenger(self.messenger.handle_mut());
         }
     }
 }
@@ -242,17 +240,13 @@ impl DebugMessenger {
             .message_type(vk::DebugUtilsMessageTypeFlagsEXT::all())
             .pfn_user_callback(Some(debug_utils_messenger_callback));
 
-        // Safety: The raw extension object is not moved out of the guard.
-        let debug_utils = unsafe { instance.write_ext_debug_utils_raw() };
-
-        // Safety:
-        // - The DebugUtils extension is acquired from the Instance.
-        // - The Instance is kept alive by this struct's internal handle until
-        //   the debug messenger is destroyed.
-        let messenger = unsafe { debug_utils.create_debug_utils_messenger(&debug_ext_info, None) }
-            .expect("failed to create debug messenger");
-
-        drop(debug_utils);
+        // Safety: messenger is destroyed in Drop impl.
+        let messenger = unsafe {
+            instance
+                .read_inner()
+                .handle()
+                .create_debug_utils_messenger(&debug_ext_info)
+        };
 
         DebugMessenger {
             instance,
