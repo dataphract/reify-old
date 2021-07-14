@@ -1,11 +1,9 @@
 use std::{
     ffi::CStr,
     fmt::{self, Write},
-    sync::Arc,
 };
 
-use ash::{extensions::ext, vk};
-use parking_lot::RwLock;
+use erupt::vk;
 
 use crate::{vks, Instance, VkSyncObject};
 
@@ -132,7 +130,7 @@ where
 
 const DEBUG_MESSAGE_INIT_CAPACITY: usize = 128;
 unsafe extern "system" fn debug_utils_messenger_callback(
-    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    severity: vk::DebugUtilsMessageSeverityFlagBitsEXT,
     ty: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     user_data: *mut std::ffi::c_void,
@@ -151,7 +149,7 @@ unsafe extern "system" fn debug_utils_messenger_callback(
 }
 
 fn debug_utils_messenger_callback_impl(
-    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    severity: vk::DebugUtilsMessageSeverityFlagBitsEXT,
     ty: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _user_data: *mut std::ffi::c_void,
@@ -159,10 +157,10 @@ fn debug_utils_messenger_callback_impl(
     let callback_data = unsafe { *callback_data };
 
     let severity = match severity {
-        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => log::Level::Error,
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => log::Level::Warn,
-        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => log::Level::Info,
-        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => log::Level::Trace,
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::ERROR_EXT => log::Level::Error,
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::WARNING_EXT => log::Level::Warn,
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::INFO_EXT => log::Level::Info,
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::VERBOSE_EXT => log::Level::Trace,
         _ => log::Level::Warn,
     };
 
@@ -234,7 +232,7 @@ impl Drop for DebugMessenger {
 impl DebugMessenger {
     /// Initializes a new `DebugUtils`.
     pub fn new(instance: Instance) -> DebugMessenger {
-        let debug_ext_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+        let debug_ext_info = vk::DebugUtilsMessengerCreateInfoEXTBuilder::new()
             .flags(vk::DebugUtilsMessengerCreateFlagsEXT::empty())
             .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::all())
             .message_type(vk::DebugUtilsMessageTypeFlagsEXT::all())
@@ -246,7 +244,8 @@ impl DebugMessenger {
                 .read_inner()
                 .handle()
                 .create_debug_utils_messenger(&debug_ext_info)
-        };
+        }
+        .expect("failed to create debug messenger");
 
         DebugMessenger {
             instance,

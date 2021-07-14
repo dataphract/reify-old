@@ -1,5 +1,5 @@
 use raw_window_handle::HasRawWindowHandle;
-use reify::Instance;
+use reify::{Instance, SwapchainCreateInfo};
 use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,

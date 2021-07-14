@@ -2,20 +2,16 @@
 #![feature(once_cell)]
 
 mod debug_utils;
-mod vks;
+mod display;
+pub mod vks;
 
 use std::{
     ffi::{CStr, CString},
-    ops::Deref,
     sync::Arc,
 };
 
 use arrayvec::ArrayVec;
-use ash::{
-    extensions::{ext, khr},
-    version::{DeviceV1_0, EntryV1_0, InstanceV1_0},
-    vk,
-};
+use erupt::vk;
 use parking_lot::{RwLock, RwLockReadGuard};
 use raw_window_handle::RawWindowHandle;
 use vks::{VkObject, VkSyncObject};
@@ -31,27 +27,27 @@ pub struct ApiVersion {
 
 impl ApiVersion {
     pub const V1_0_0: ApiVersion = ApiVersion {
-        inner: vk::make_version(1, 0, 0),
+        inner: vk::make_api_version(0, 1, 0, 0),
     };
 
     pub const V1_1_0: ApiVersion = ApiVersion {
-        inner: vk::make_version(1, 1, 0),
+        inner: vk::make_api_version(0, 1, 1, 0),
     };
 
     pub const V1_2_0: ApiVersion = ApiVersion {
-        inner: vk::make_version(1, 2, 0),
+        inner: vk::make_api_version(0, 1, 2, 0),
     };
 
     pub const fn major(&self) -> u32 {
-        vk::version_major(self.inner)
+        vk::api_version_major(self.inner)
     }
 
     pub const fn minor(&self) -> u32 {
-        vk::version_minor(self.inner)
+        vk::api_version_minor(self.inner)
     }
 
     pub const fn patch(&self) -> u32 {
-        vk::version_patch(self.inner)
+        vk::api_version_patch(self.inner)
     }
 
     pub const fn from_u32(version: u32) -> ApiVersion {
@@ -80,14 +76,6 @@ pub enum ExtensionFn<T> {
 }
 
 pub(crate) struct InstanceInner {
-    // NOTE: Drop correctness depends on field order!
-
-    // Extensions.
-    get_physical_device_properties: ExtensionFn<vk::KhrGetPhysicalDeviceProperties2Fn>,
-    external_memory_capabilities: ExtensionFn<vk::KhrExternalMemoryCapabilitiesFn>,
-    display: khr::Display,
-    debug_utils: ext::DebugUtils,
-
     // Underlying instance. Destroys the instance when dropped.
     handle: vks::Instance,
 }
@@ -107,56 +95,61 @@ impl Instance {
     /// Lists the set of required extensions for the current platform.
     fn required_extensions(api_version: ApiVersion) -> Vec<&'static CStr> {
         let entry = vks::entry();
-        let instance_extensions = entry
-            .enumerate_instance_extension_properties()
-            .expect("failed to enumerate instance extension properties");
+        let instance_extensions =
+            unsafe { entry.enumerate_instance_extension_properties(None, None) }
+                .expect("failed to enumerate instance extension properties");
 
         let mut extensions = Vec::new();
 
-        extensions.push(khr::Surface::name());
+        extensions.push(vk::KHR_SURFACE_EXTENSION_NAME);
         if cfg!(all(
             unix,
             not(target_os = "android"),
             not(target_os = "macos")
         )) {
-            extensions.push(khr::WaylandSurface::name());
-            extensions.push(khr::XcbSurface::name());
-            extensions.push(khr::XlibSurface::name());
+            extensions.push(vk::KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+            extensions.push(vk::KHR_XCB_SURFACE_EXTENSION_NAME);
+            extensions.push(vk::KHR_XLIB_SURFACE_EXTENSION_NAME);
         } else {
             unimplemented!("only tested on linux at the moment, sorry :(");
         }
 
-        extensions.push(ext::DebugUtils::name());
-        extensions.push(vk::KhrGetPhysicalDeviceProperties2Fn::name());
-        extensions.push(vk::ExtDisplaySurfaceCounterFn::name());
-        extensions.push(khr::Display::name());
+        extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION_NAME);
+        extensions.push(vk::KHR_XCB_SURFACE_EXTENSION_NAME);
+        extensions.push(vk::EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME);
+        extensions.push(vk::KHR_DISPLAY_EXTENSION_NAME);
 
         if api_version < ApiVersion::V1_1_0 {
-            extensions.push(vk::KhrExternalMemoryCapabilitiesFn::name());
+            extensions.push(vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+            extensions.push(vk::KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
         }
 
-        extensions.retain(|&ext| {
+        let mut extension_cstrs = extensions
+            .into_iter()
+            .map(|ptr| unsafe { CStr::from_ptr(ptr) })
+            .collect::<Vec<_>>();
+
+        extension_cstrs.retain(|&wanted| {
             for inst_ext in instance_extensions.iter() {
                 let inst_ext_cstr = i8_slice_to_cstr(&inst_ext.extension_name)
                     .expect("extension name is not NUL-terminated");
 
-                if ext == inst_ext_cstr {
+                if wanted == inst_ext_cstr {
                     return true;
                 }
             }
 
-            log::warn!("Extension not found: {}", ext.to_string_lossy());
+            log::warn!("Extension not found: {}", wanted.to_string_lossy());
             false
         });
 
-        extensions
+        extension_cstrs
     }
 
     /// Lists the set of required layers.
     fn required_layers() -> Vec<&'static CStr> {
         let entry = vks::entry();
-        let instance_layers = entry
-            .enumerate_instance_layer_properties()
+        let instance_layers = unsafe { entry.enumerate_instance_layer_properties(None) }
             .expect("failed to enumerate instance layer properties");
 
         let mut layers = Vec::new();
@@ -187,14 +180,13 @@ impl Instance {
     {
         let entry = vks::entry();
 
-        let driver_api_version = match entry.try_enumerate_instance_version() {
-            Ok(Some(version)) => ApiVersion::from_u32(version),
-            Ok(None) => ApiVersion::V1_0_0,
+        let driver_api_version = match unsafe { entry.enumerate_instance_version() }.result() {
+            Ok(version) => ApiVersion::from_u32(version),
             Err(e) => panic!("failed to query instance version: {}", e),
         };
 
         let app_name = CString::new(app_name.as_ref()).unwrap();
-        let app_info = vk::ApplicationInfo::builder()
+        let app_info = vk::ApplicationInfoBuilder::new()
             .application_name(app_name.as_c_str())
             .application_version(app_version)
             .engine_name(CStr::from_bytes_with_nul(b"reify\0").unwrap())
@@ -208,81 +200,21 @@ impl Instance {
             let ext_ptrs = extensions.iter().map(|&s| s.as_ptr()).collect::<Vec<_>>();
             let layer_ptrs = layers.iter().map(|&s| s.as_ptr()).collect::<Vec<_>>();
 
-            let create_info = vk::InstanceCreateInfo::builder()
+            let create_info = vk::InstanceCreateInfoBuilder::new()
                 .flags(vk::InstanceCreateFlags::empty())
                 .application_info(&app_info)
                 .enabled_layer_names(&layer_ptrs)
                 .enabled_extension_names(&ext_ptrs);
 
-            match unsafe { entry.create_instance(&create_info, None) } {
-                // Safety: raw handle is not accessible anywhere else.
-                Ok(raw) => unsafe { vks::Instance::new(raw) },
-                Err(e) => panic!("failed to create raw Vulkan instance: {}", e),
-            }
+            vks::Instance::create(&create_info).expect("failed to create raw Vulkan instance: {}")
         };
 
-        let instance_extensions = entry
-            .enumerate_instance_extension_properties()
-            .expect("failed to enumerate instance extension properties");
-
-        let get_physical_device_properties = if driver_api_version >= ApiVersion::V1_1_0 {
-            ExtensionFn::Core
-        } else {
-            if !extensions
-                .iter()
-                .any(|&ext| ext == vk::KhrGetPhysicalDeviceProperties2Fn::name())
-            {
-                panic!("missing required extension: VK_KHR_get_physical_device_properties2");
-            }
-
-            let load_fn = |name: &CStr| unsafe {
-                let raw_handle = instance_handle.handle().raw().handle();
-                let addr = entry.get_instance_proc_addr(raw_handle, name.as_ptr());
-                std::mem::transmute::<vk::PFN_vkVoidFunction, *const std::ffi::c_void>(addr)
-            };
-
-            ExtensionFn::Extension(vk::KhrGetPhysicalDeviceProperties2Fn::load(load_fn))
-        };
-
-        let external_memory_capabilities = if driver_api_version >= ApiVersion::V1_1_0 {
-            ExtensionFn::Core
-        } else {
-            if !extensions
-                .iter()
-                .any(|&ext| ext == vk::KhrExternalMemoryCapabilitiesFn::name())
-            {
-                panic!("missing required extension: VK_KHR_external_memory_capabilities");
-            }
-
-            let load_fn = |name: &CStr| unsafe {
-                let raw_handle = instance_handle.handle().raw().handle();
-                let addr = entry.get_instance_proc_addr(raw_handle, name.as_ptr());
-                std::mem::transmute::<vk::PFN_vkVoidFunction, *const std::ffi::c_void>(addr)
-            };
-
-            ExtensionFn::Extension(vk::KhrExternalMemoryCapabilitiesFn::load(load_fn))
-        };
-
-        if !extensions.contains(&khr::Display::name()) {
-            panic!("missing required extension: VK_KHR_display");
-        }
-
-        let display = khr::Display::new(entry, unsafe { instance_handle.handle().raw() });
-
-        if !instance_extensions.iter().any(|props| {
-            i8_slice_to_cstr(&props.extension_name).unwrap() == ext::DebugUtils::name()
-        }) {
-            panic!("missing required extension: VK_EXT_debug_utils")
-        }
-
-        let debug_utils = ext::DebugUtils::new(entry, unsafe { instance_handle.handle().raw() });
+        let instance_extensions =
+            unsafe { entry.enumerate_instance_extension_properties(None, None) }
+                .expect("failed to enumerate instance extension properties");
 
         Instance {
             inner: Arc::new(RwLock::new(InstanceInner {
-                get_physical_device_properties,
-                external_memory_capabilities,
-                display,
-                debug_utils,
                 handle: instance_handle,
             })),
         }
@@ -312,37 +244,36 @@ impl Instance {
     ))]
     pub fn create_surface(&self, window: RawWindowHandle) -> Surface {
         let read_lock = self.inner.read();
-        let instance = read_lock.handle.handle();
 
         let raw_surface = match window {
             RawWindowHandle::Xlib(xlib) => {
-                let xlib_ext = khr::XlibSurface::new(vks::entry(), unsafe { instance.raw() });
-                let create_info = vk::XlibSurfaceCreateInfoKHR::builder()
+                let create_info = vk::XlibSurfaceCreateInfoKHRBuilder::new()
                     .flags(vk::XlibSurfaceCreateFlagsKHR::empty())
                     .dpy(xlib.display as *mut _)
                     .window(xlib.window);
 
                 unsafe {
-                    vks::Surface::new(
-                        xlib_ext
-                            .create_xlib_surface(&create_info, None)
-                            .expect("failed to create Xlib window surface"),
-                    )
+                    read_lock
+                        .handle
+                        .handle()
+                        .raw()
+                        .create_xlib_surface_khr(&create_info, None)
+                        .expect("failed to create Xlib window surface")
                 }
             }
             RawWindowHandle::Xcb(xcb) => {
-                let xcb_ext = khr::XcbSurface::new(vks::entry(), unsafe { instance.raw() });
-                let create_info = vk::XcbSurfaceCreateInfoKHR::builder()
+                let create_info = vk::XcbSurfaceCreateInfoKHRBuilder::new()
                     .flags(vk::XcbSurfaceCreateFlagsKHR::empty())
                     .window(xcb.window)
                     .connection(xcb.connection);
 
                 unsafe {
-                    vks::Surface::new(
-                        xcb_ext
-                            .create_xcb_surface(&create_info, None)
-                            .expect("failed to create XCB window surface"),
-                    )
+                    read_lock
+                        .handle
+                        .handle()
+                        .raw()
+                        .create_xcb_surface_khr(&create_info, None)
+                        .expect("failed to create XCB window surface")
                 }
             }
             RawWindowHandle::Wayland(_) => todo!(),
@@ -354,7 +285,7 @@ impl Instance {
         Surface {
             inner: Arc::new(RwLock::new(SurfaceInner {
                 instance: self.clone(),
-                raw: raw_surface,
+                raw: Some(unsafe { vks::Surface::new(raw_surface) }),
             })),
         }
     }
@@ -373,8 +304,7 @@ impl Instance {
     pub fn enumerate_physical_devices(&self, surface: &Surface) -> Vec<PhysicalDevice> {
         let read_lock = self.inner.read();
 
-        let devices = match unsafe { read_lock.handle.handle().raw().enumerate_physical_devices() }
-        {
+        let devices = match unsafe { read_lock.handle.enumerate_physical_devices() } {
             Ok(devices) => devices,
             Err(e) => {
                 log::error!("failed to enumerate physical devices: {}", e);
@@ -391,8 +321,8 @@ impl Instance {
                 unsafe {
                     PhysicalDevice::new(
                         self.clone(),
-                        vks::PhysicalDevice::new(raw),
-                        &surface.inner.read().raw,
+                        raw,
+                        &surface.inner.read().raw.as_ref().expect("Surface is None"),
                     )
                 }
             })
@@ -455,9 +385,6 @@ impl PhysicalDevice {
         let mut transfer_queue = None;
         let mut present_queue = None;
 
-        let surface_ext =
-            unsafe { khr::Surface::new(vks::entry(), &*read_lock.handle.handle().raw()) };
-
         for (index, qf) in queue_families.iter().enumerate() {
             match graphics_queue {
                 // Already have a dedicated queue.
@@ -501,8 +428,11 @@ impl PhysicalDevice {
             // - Queue family index provided by physical device.
             // - No external synchronization requirement.
             if unsafe {
-                surface_ext
-                    .get_physical_device_surface_support(
+                read_lock
+                    .handle()
+                    .handle()
+                    .raw()
+                    .get_physical_device_surface_support_khr(
                         *phys_device.handle().raw(),
                         index as u32,
                         *surface.handle().raw(),
@@ -592,13 +522,19 @@ impl PhysicalDevice {
 
     pub fn create_device(&self) -> Device {
         let mut unique_queue_families = UniqueQueueFamilies::default();
-        let graphics = unique_queue_families.get_or_insert(self.inner.graphics_queue_family) as u8;
-        let transfer = unique_queue_families.get_or_insert(self.inner.transfer_queue_family) as u8;
-        let present = unique_queue_families.get_or_insert(self.inner.present_queue_family) as u8;
+        let graphics = unique_queue_families
+            .get_or_insert(self.inner.graphics_queue_family, SINGLE_QUEUE_PRIORITY)
+            as u8;
+        let transfer = unique_queue_families
+            .get_or_insert(self.inner.transfer_queue_family, SINGLE_QUEUE_PRIORITY)
+            as u8;
+        let present = unique_queue_families
+            .get_or_insert(self.inner.present_queue_family, SINGLE_QUEUE_PRIORITY)
+            as u8;
 
-        let phys_device_features = vk::PhysicalDeviceFeatures::builder();
+        let phys_device_features = vk::PhysicalDeviceFeaturesBuilder::new();
         let enabled_layer_names = &[LAYER_NAME_VALIDATION.as_ptr() as *const i8];
-        let device_create_info = vk::DeviceCreateInfo::builder()
+        let device_create_info = vk::DeviceCreateInfoBuilder::new()
             .flags(vk::DeviceCreateFlags::empty())
             .queue_create_infos(unique_queue_families.infos())
             .enabled_layer_names(enabled_layer_names)
@@ -623,13 +559,13 @@ impl PhysicalDevice {
             instance: self.inner.instance.clone(),
         }));
 
-        let inner_lock = inner.read();
+        let inner_read = inner.read();
 
         let mut queues = ArrayVec::new();
         for info in unique_queue_families.infos() {
             let raw_queue = unsafe {
                 vks::Queue::new(
-                    inner_lock
+                    inner_read
                         .raw
                         .handle()
                         .raw()
@@ -647,7 +583,7 @@ impl PhysicalDevice {
             queues.push(queue);
         }
 
-        drop(inner_lock);
+        drop(inner_read);
 
         let queues = DeviceQueues {
             queues,
@@ -663,14 +599,16 @@ impl PhysicalDevice {
 // Graphics, compute, transfer, present
 const MAX_DEVICE_QUEUES: usize = 4;
 
+static SINGLE_QUEUE_PRIORITY: &'static [f32] = &[1.0];
+
 #[derive(Default)]
-struct UniqueQueueFamilies {
+struct UniqueQueueFamilies<'a> {
     family_ids: ArrayVec<u32, MAX_DEVICE_QUEUES>,
-    infos: ArrayVec<vk::DeviceQueueCreateInfo, MAX_DEVICE_QUEUES>,
+    infos: ArrayVec<vk::DeviceQueueCreateInfoBuilder<'a>, MAX_DEVICE_QUEUES>,
 }
 
-impl UniqueQueueFamilies {
-    fn get_or_insert(&mut self, family_id: u32) -> usize {
+impl<'a> UniqueQueueFamilies<'a> {
+    fn get_or_insert(&mut self, family_id: u32, priorities: &'a [f32]) -> usize {
         match self
             .family_ids
             .iter()
@@ -682,18 +620,17 @@ impl UniqueQueueFamilies {
                 let i = self.family_ids.len();
                 self.family_ids.push(family_id);
                 self.infos.push(
-                    vk::DeviceQueueCreateInfo::builder()
+                    vk::DeviceQueueCreateInfoBuilder::new()
                         .flags(vk::DeviceQueueCreateFlags::empty())
                         .queue_family_index(family_id)
-                        .queue_priorities(&[1.0])
-                        .build(),
+                        .queue_priorities(priorities),
                 );
                 i
             }
         }
     }
 
-    fn infos(&self) -> &[vk::DeviceQueueCreateInfo] {
+    fn infos(&self) -> &[vk::DeviceQueueCreateInfoBuilder<'a>] {
         self.infos.as_slice()
     }
 }
@@ -769,32 +706,66 @@ pub struct Queue {
 
 struct SurfaceInner {
     instance: Instance,
-    raw: vks::Surface,
+    raw: Option<vks::Surface>,
 }
 
 impl Drop for SurfaceInner {
     fn drop(&mut self) {
         let instance = self.instance.inner.read();
 
-        // Safety:
-        // - Swapchain objects have handles to this surface, so it will not be
-        //   dropped before they are.
-        // - Host access synchronization guaranteed by mutable receiver.
-        unsafe {
-            let surface_ext = khr::Surface::new(vks::entry(), &*instance.handle.handle().raw());
-            surface_ext.destroy_surface(*self.raw.handle_mut().raw_mut(), None);
+        match self.raw.take() {
+            Some(raw) => unsafe {
+                // Safety:
+                // - Swapchain objects have handles to this surface, so it will not be
+                //   dropped before they are.
+                // - Host access synchronization guaranteed by mutable receiver.
+                instance.handle.destroy_surface(raw);
+            },
+            None => {
+                log::warn!("Possible leak of Surface");
+            }
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Surface {
     inner: Arc<RwLock<SurfaceInner>>,
 }
 
+pub struct SwapchainCreateInfo {
+    pub flags: vk::SwapchainCreateFlagsKHR,
+    pub surface: Surface,
+    pub min_image_count: u32,
+    pub image_format: vk::Format,
+    pub image_color_space: vk::ColorSpaceKHR,
+    pub image_extent: vk::Extent2D,
+    pub image_array_layers: u32,
+    pub image_usage: vk::ImageUsageFlags,
+    pub pre_transform: vk::SurfaceTransformFlagsKHR,
+    pub composite_alpha: vk::CompositeAlphaFlagsKHR,
+    pub present_mode: vk::PresentModeKHR,
+    pub clipped: bool,
+}
+
 struct SwapchainInner {
+    // NOTE: sensitive drop order.
+    raw: Option<vks::Swapchain>,
+    device: Device,
     surface: Surface,
 }
 
-struct Swapchain {
+impl Drop for SwapchainInner {
+    fn drop(&mut self) {
+        if let Some(swapchain) = self.raw.take() {
+            let device_read = self.device.inner.read();
+
+            unsafe { device_read.raw.destroy_swapchain(swapchain) }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Swapchain {
     inner: Arc<RwLock<SwapchainInner>>,
 }

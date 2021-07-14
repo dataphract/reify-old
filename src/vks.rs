@@ -7,22 +7,19 @@
 //! that a parameter be externally synchronized accept a `HandleMut`, which may
 //! not be obtained without exclusive access to the object.
 
-use ash::{
-    extensions::{ext, khr},
-    prelude::VkResult,
-    version::{DeviceV1_0, EntryV1_0, InstanceV1_0},
-    vk,
-};
+use erupt::{vk, DeviceLoader, EntryLoader, InstanceLoader, LoaderError};
 
 use std::lazy::SyncOnceCell;
 
-static ENTRY: SyncOnceCell<ash::Entry> = SyncOnceCell::new();
+static ENTRY: SyncOnceCell<EntryLoader> = SyncOnceCell::new();
 
-pub fn entry() -> &'static ash::Entry {
+pub fn entry() -> &'static EntryLoader {
     ENTRY
-        .get_or_try_init(|| unsafe { ash::Entry::new() })
+        .get_or_try_init(|| unsafe { EntryLoader::new() })
         .expect("failed to load Vulkan dynamic library")
 }
+
+pub type VkResult<T> = std::result::Result<T, vk::Result>;
 
 /// A Vulkan API object.
 ///
@@ -147,31 +144,53 @@ macro_rules! define_sync_handle {
 
 // ============================================================================
 
-define_sync_handle! {
-    /// An opaque handle to a Vulkan instance.
-    pub struct Instance(ash::Instance);
+pub struct Instance {
+    // Boxed to reduce stack space usage.
+    loader: Box<InstanceLoader>,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        unsafe {
+            // Safety: instance is not used again.
+            self.loader.destroy_instance(None);
+        }
+    }
+}
+
+unsafe impl VkObject for Instance {
+    type Raw = InstanceLoader;
+
+    fn handle<'a>(&'a self) -> Handle<'a, Self::Raw> {
+        Handle { raw: &self.loader }
+    }
+}
+
+unsafe impl VkSyncObject for Instance {
+    fn handle_mut<'a>(&'a mut self) -> HandleMut<'a, Self::Raw> {
+        HandleMut {
+            raw: &mut self.loader,
+        }
+    }
 }
 
 impl Instance {
-    /// Constructs a new `Instance` which owns the Vulkan instance associated
-    /// with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must guarantee that `raw` is not used as a parameter to any
-    /// Vulkan API call after this constructor is called.
+    /// Creates a new Vulkan instance.
     #[inline]
-    pub unsafe fn new(raw: ash::Instance) -> Instance {
-        Instance { raw }
+    pub fn create(create_info: &vk::InstanceCreateInfo) -> Result<Instance, LoaderError> {
+        let loader = unsafe { InstanceLoader::new(entry(), create_info, None) }?;
+        Ok(Instance {
+            loader: Box::new(loader),
+        })
     }
 
     #[inline]
-    pub fn enumerate_physical_devices(&self) -> ash::prelude::VkResult<Vec<PhysicalDevice>> {
+    pub fn enumerate_physical_devices(&self) -> VkResult<Vec<PhysicalDevice>> {
         unsafe {
             Ok(self
-                .handle()
-                .raw()
-                .enumerate_physical_devices()?
+                .loader
+                .enumerate_physical_devices(None)
+                .result()?
                 .into_iter()
                 .map(|raw| PhysicalDevice::new(raw))
                 .collect())
@@ -190,11 +209,7 @@ impl Instance {
         &self,
         phys_device: Handle<'_, vk::PhysicalDevice>,
     ) -> vk::PhysicalDeviceFeatures {
-        unsafe {
-            self.handle()
-                .raw()
-                .get_physical_device_features(*phys_device.raw())
-        }
+        unsafe { self.loader.get_physical_device_features(*phys_device.raw()) }
     }
 
     /// Returns properties of a physical device.
@@ -210,8 +225,7 @@ impl Instance {
         phys_device: Handle<'_, vk::PhysicalDevice>,
     ) -> vk::PhysicalDeviceProperties {
         unsafe {
-            self.handle()
-                .raw()
+            self.loader
                 .get_physical_device_properties(*phys_device.raw())
         }
     }
@@ -229,41 +243,84 @@ impl Instance {
         phys_device: Handle<'_, vk::PhysicalDevice>,
     ) -> Vec<vk::QueueFamilyProperties> {
         unsafe {
-            self.handle()
-                .raw()
-                .get_physical_device_queue_family_properties(*phys_device.raw())
+            self.loader
+                .get_physical_device_queue_family_properties(*phys_device.raw(), None)
         }
     }
 
+    /// Queries surface capabilities.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `phys_device` must be a physical device handle associated with this
+    ///   instance.
+    /// - `surface` must be a surface handle associated with this instance.
+    #[inline]
+    pub unsafe fn get_physical_device_surface_capabilities_khr(
+        &self,
+        phys_device: Handle<'_, vk::PhysicalDevice>,
+        surface: Handle<'_, vk::SurfaceKHR>,
+    ) -> VkResult<vk::SurfaceCapabilitiesKHR> {
+        unsafe {
+            self.loader
+                .get_physical_device_surface_capabilities_khr(*phys_device.raw(), *surface.raw())
+                .result()
+        }
+    }
+
+    /// Queries color formats supported by a surface.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `phys_device` must be a physical device handle associated with this
+    ///   instance.
+    /// - `surface` must be a surface handle associated with this instance.
+    #[inline]
+    pub unsafe fn get_physical_device_surface_formats_khr(
+        &self,
+        phys_device: Handle<'_, vk::PhysicalDevice>,
+        surface: Handle<'_, vk::SurfaceKHR>,
+    ) -> VkResult<Vec<vk::SurfaceFormatKHR>> {
+        unsafe {
+            self.loader
+                .get_physical_device_surface_formats_khr(*phys_device.raw(), *surface.raw(), None)
+                .result()
+        }
+    }
+
+    /// Creates a new device instance.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `phys_device` must be a physical device handle associated with this
+    ///   instance.
     #[inline]
     pub unsafe fn create_device(
         &self,
         phys_device: Handle<'_, vk::PhysicalDevice>,
         create_info: &vk::DeviceCreateInfo,
-    ) -> VkResult<Device> {
+    ) -> Result<Device, LoaderError> {
         unsafe {
-            Ok(Device::new(self.handle().raw().create_device(
-                *phys_device.raw(),
-                create_info,
-                None,
-            )?))
+            let loader = DeviceLoader::new(&self.loader, *phys_device.raw(), create_info, None)?;
+            Ok(Device::new(loader))
         }
     }
 
+    #[inline]
     pub unsafe fn create_debug_utils_messenger(
         &self,
         info: &vk::DebugUtilsMessengerCreateInfoEXT,
-    ) -> DebugMessenger {
-        let entry = entry();
-        let instance = self.handle();
-
+    ) -> VkResult<DebugMessenger> {
         unsafe {
-            let debug_utils = ext::DebugUtils::new(entry, instance.raw());
-            DebugMessenger::new(
-                debug_utils
-                    .create_debug_utils_messenger(info, None)
-                    .expect("failed to create debug messenger"),
-            )
+            let debug_messenger = self
+                .loader
+                .create_debug_utils_messenger_ext(info, None)
+                .result()?;
+
+            Ok(DebugMessenger::new(debug_messenger))
         }
     }
 
@@ -271,23 +328,21 @@ impl Instance {
         &self,
         messenger: HandleMut<'_, vk::DebugUtilsMessengerEXT>,
     ) {
-        let entry = entry();
-        let instance = self.handle();
-
         // Safety:
-        // - DebugUtils instance handle is obtained from `Handle`.
         // - Access to debug messenger is externally synchronized via `HandleMut`.
         unsafe {
-            let debug_utils = ext::DebugUtils::new(entry, instance.raw());
-            debug_utils.destroy_debug_utils_messenger(*messenger.raw_mut(), None);
+            self.loader
+                .destroy_debug_utils_messenger_ext(Some(*messenger.raw_mut()), None);
         }
     }
-}
 
-impl Drop for Instance {
-    fn drop(&mut self) {
-        // Safety: raw handle is externally synchronized by InstanceHandle contract.
-        unsafe { self.raw.destroy_instance(None) }
+    pub unsafe fn destroy_surface(&self, mut surface: Surface) {
+        // Safety:
+        // - Access to surface is externally synchronized via ownership.
+        unsafe {
+            self.loader
+                .destroy_surface_khr(Some(*surface.handle_mut().raw_mut()), None);
+        }
     }
 }
 
@@ -315,29 +370,109 @@ impl PhysicalDevice {
 
 // ============================================================================
 
-define_sync_handle! {
-    /// An opaque handle to a Vulkan logical device object.
-    pub struct Device(ash::Device);
-}
-
-impl Device {
-    /// Constructs a new `Device` which owns the logical device object
-    /// associated with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Device` object.
-    pub unsafe fn new(raw: ash::Device) -> Device {
-        Device { raw }
-    }
+pub struct Device {
+    loader: Box<DeviceLoader>,
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        unsafe { self.raw.destroy_device(None) }
+        unsafe {
+            // Safety: device is not used again.
+            self.loader.destroy_device(None);
+        }
+    }
+}
+
+unsafe impl VkObject for Device {
+    type Raw = DeviceLoader;
+
+    fn handle<'a>(&'a self) -> Handle<'a, Self::Raw> {
+        Handle { raw: &self.loader }
+    }
+}
+
+unsafe impl VkSyncObject for Device {
+    fn handle_mut<'a>(&'a mut self) -> HandleMut<'a, Self::Raw> {
+        HandleMut {
+            raw: &mut self.loader,
+        }
+    }
+}
+
+impl Device {
+    /// Constructs a new `Device` which owns the logical device object
+    /// associated with `loader`.
+    fn new(loader: DeviceLoader) -> Device {
+        Device {
+            loader: Box::new(loader),
+        }
+    }
+
+    /// Destroy a swapchain object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `swapchain` must be a swapchain object associated with this instance.
+    pub unsafe fn destroy_swapchain(&self, mut swapchain: Swapchain) {
+        unsafe {
+            // Safety:
+            // - `swapchain` is externally synchronized, as it is received by value.
+            self.loader
+                .destroy_swapchain_khr(Some(*swapchain.handle_mut().raw_mut()), None);
+        }
+    }
+
+    /// Create a swapchain.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `device` must be a handle to a device object associated with this
+    ///   instance.
+    /// - `create_info.surface` must be a handle to a surface associated with
+    ///   this instance.
+    /// - If `create_info.old_swapchain` is `Some(old)`, then `old` must be a
+    ///   handle to a non-retired swapchain associated with
+    ///   `create_info.surface`.
+    #[inline]
+    pub unsafe fn create_swapchain(
+        &self,
+        create_info: &mut SwapchainCreateInfo<'_, '_>,
+    ) -> VkResult<Swapchain> {
+        unsafe {
+            let raw_create_info = vk::SwapchainCreateInfoKHRBuilder::new()
+                .flags(create_info.flags)
+                // Safety: surface is externally synchronized via `HandleMut`.
+                .surface(*create_info.surface.raw_mut())
+                .min_image_count(create_info.min_image_count)
+                .image_format(create_info.image_format)
+                .image_color_space(create_info.image_color_space)
+                .image_extent(create_info.image_extent)
+                .image_array_layers(create_info.image_array_layers)
+                .image_usage(create_info.image_usage)
+                .image_sharing_mode(create_info.image_sharing_mode)
+                .queue_family_indices(create_info.queue_family_indices)
+                .pre_transform(create_info.pre_transform)
+                .composite_alpha(create_info.composite_alpha)
+                .present_mode(create_info.present_mode)
+                .clipped(create_info.clipped)
+                // Safety: old swapchain, if any, is externally synchronized via `HandleMut`.
+                .old_swapchain(
+                    create_info
+                        .old_swapchain
+                        .take()
+                        .map(|mut os| *os.handle_mut().raw_mut())
+                        .unwrap_or(vk::SwapchainKHR::null()),
+                );
+
+            let swapchain = self
+                .loader
+                .create_swapchain_khr(&raw_create_info, None)
+                .result()?;
+
+            Ok(Swapchain::new(swapchain))
+        }
     }
 }
 
@@ -385,6 +520,46 @@ impl Surface {
     pub unsafe fn new(raw: vk::SurfaceKHR) -> Surface {
         Surface { raw }
     }
+}
+
+// ============================================================================
+
+define_sync_handle! {
+    /// An opaque handle to a Vulkan swapchain object.
+    pub struct Swapchain(vk::SwapchainKHR);
+}
+
+impl Swapchain {
+    /// Constructs a new `Swapchain` which owns the swapchain associated with
+    /// the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `Swapchain` object.
+    pub unsafe fn new(raw: vk::SwapchainKHR) -> Swapchain {
+        Swapchain { raw }
+    }
+}
+
+pub struct SwapchainCreateInfo<'surf, 'queues> {
+    pub flags: vk::SwapchainCreateFlagsKHR,
+    pub surface: HandleMut<'surf, vk::SurfaceKHR>,
+    pub min_image_count: u32,
+    pub image_format: vk::Format,
+    pub image_color_space: vk::ColorSpaceKHR,
+    pub image_extent: vk::Extent2D,
+    pub image_array_layers: u32,
+    pub image_usage: vk::ImageUsageFlags,
+    pub image_sharing_mode: vk::SharingMode,
+    pub queue_family_indices: &'queues [u32],
+    pub pre_transform: vk::SurfaceTransformFlagBitsKHR,
+    pub composite_alpha: vk::CompositeAlphaFlagBitsKHR,
+    pub present_mode: vk::PresentModeKHR,
+    pub clipped: bool,
+    pub old_swapchain: Option<Swapchain>,
 }
 
 // ============================================================================
