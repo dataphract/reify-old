@@ -459,21 +459,6 @@ impl Device {
         }
     }
 
-    /// Destroy a swapchain object.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `swapchain` must be a swapchain object associated with this instance.
-    pub unsafe fn destroy_swapchain(&self, mut swapchain: Swapchain) {
-        unsafe {
-            // Safety:
-            // - `swapchain` is externally synchronized, as it is received by value.
-            self.loader
-                .destroy_swapchain_khr(Some(*swapchain.handle_mut().raw_mut()), None);
-        }
-    }
-
     /// Create a swapchain.
     ///
     /// # Safety
@@ -525,6 +510,44 @@ impl Device {
             Ok(Swapchain::new(swapchain))
         }
     }
+
+    /// Destroy a swapchain object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `swapchain` must be a swapchain object associated with this instance.
+    pub unsafe fn destroy_swapchain(&self, mut swapchain: Swapchain) {
+        unsafe {
+            // Safety:
+            // - `swapchain` is externally synchronized, as it is received by value.
+            self.loader
+                .destroy_swapchain_khr(Some(*swapchain.handle_mut().raw_mut()), None);
+        }
+    }
+
+    /// Obtains the array of presentable images associated with a swapchain.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `swapchain` must be a handle to a swapchain object associated with
+    ///   this logical device.
+    #[inline]
+    pub unsafe fn get_swapchain_images_khr(
+        &self,
+        swapchain: Handle<'_, vk::SwapchainKHR>,
+    ) -> VkResult<Vec<Image>> {
+        unsafe {
+            Ok(self
+                .loader
+                .get_swapchain_images_khr(*swapchain.raw(), None)
+                .result()?
+                .into_iter()
+                .map(|img| Image::new(img))
+                .collect())
+        }
+    }
 }
 
 // ============================================================================
@@ -547,6 +570,32 @@ impl Queue {
     /// - TODO: must not be used after parent `Device` is destroyed
     pub unsafe fn new(raw: vk::Queue) -> Queue {
         Queue { raw }
+    }
+}
+
+// ============================================================================
+
+define_sync_handle! {
+    /// An opaque handle to a Vulkan image object.
+    pub struct Image(vk::Image);
+}
+
+impl Image {
+    /// Constructs a new `Image` which owns the image associated with the raw
+    /// handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `Image` object.
+    /// - If the image was created by a device, it must be destroyed by a call
+    ///   to `Device::destroy_image`.
+    /// - If the image was obtained from a swapchain with `Device::get_swapchain_images_khr`,
+    ///   it must not be used after the associated swapchain has been destroyed.
+    pub unsafe fn new(raw: vk::Image) -> Image {
+        Image { raw }
     }
 }
 

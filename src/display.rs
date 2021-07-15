@@ -22,6 +22,7 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
+    images: Vec<vks::Image>,
     swapchain: Option<vks::Swapchain>,
     surface: vks::Surface,
     device: Device,
@@ -136,6 +137,9 @@ impl Display {
 
         log::info!("Successfully created swapchain.");
 
+        let images = unsafe { device_read.raw.get_swapchain_images_khr(swapchain.handle()) }
+            .expect("failed to get swapchain images");
+
         let info = DisplayInfo {
             min_image_count,
             surface_format,
@@ -145,6 +149,7 @@ impl Display {
 
         Display {
             info,
+            images,
             swapchain: Some(swapchain),
             surface,
             device: device.clone(),
