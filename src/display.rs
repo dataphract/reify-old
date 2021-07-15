@@ -22,10 +22,42 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
+    image_views: Vec<vks::ImageView>,
     images: Vec<vks::Image>,
     swapchain: Option<vks::Swapchain>,
-    surface: vks::Surface,
+    surface: Option<vks::Surface>,
     device: Device,
+}
+
+impl Drop for Display {
+    fn drop(&mut self) {
+        let device_read = self.device.inner.read();
+
+        for image_view in self.image_views.drain(..) {
+            unsafe {
+                // TODO: must allow commands to complete on image views before
+                // destroying
+                device_read.raw.destroy_image_view(image_view);
+            }
+        }
+
+        // Swapchain images do not need to be explicitly destroyed, as they are
+        // managed by the swapchain.
+
+        if let Some(swapchain) = self.swapchain.take() {
+            unsafe {
+                device_read.raw.destroy_swapchain(swapchain);
+            }
+        }
+
+        let instance_read = device_read.instance.read_inner();
+
+        if let Some(surface) = self.surface.take() {
+            unsafe {
+                instance_read.handle.destroy_surface(surface);
+            }
+        }
+    }
 }
 
 impl Display {
@@ -140,6 +172,34 @@ impl Display {
         let images = unsafe { device_read.raw.get_swapchain_images_khr(swapchain.handle()) }
             .expect("failed to get swapchain images");
 
+        let image_views = images
+            .iter()
+            .map(|img| unsafe {
+                device_read
+                    .raw
+                    .create_image_view(&vks::ImageViewCreateInfo {
+                        flags: vk::ImageViewCreateFlags::empty(),
+                        image: img.handle(),
+                        view_type: vk::ImageViewType::_2D,
+                        format: surface_format.format,
+                        components: vk::ComponentMapping {
+                            r: vk::ComponentSwizzle::IDENTITY,
+                            g: vk::ComponentSwizzle::IDENTITY,
+                            b: vk::ComponentSwizzle::IDENTITY,
+                            a: vk::ComponentSwizzle::IDENTITY,
+                        },
+                        subresource_range: vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
         let info = DisplayInfo {
             min_image_count,
             surface_format,
@@ -149,9 +209,10 @@ impl Display {
 
         Display {
             info,
+            image_views,
             images,
             swapchain: Some(swapchain),
-            surface,
+            surface: Some(surface),
             device: device.clone(),
         }
     }

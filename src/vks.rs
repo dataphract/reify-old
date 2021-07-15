@@ -459,6 +459,46 @@ impl Device {
         }
     }
 
+    /// Creates an image view from an existing image.
+    ///
+    /// # Safety
+    ///
+    /// // TODO
+    pub unsafe fn create_image_view(
+        &self,
+        create_info: &ImageViewCreateInfo,
+    ) -> VkResult<ImageView> {
+        unsafe {
+            let builder = vk::ImageViewCreateInfoBuilder::new()
+                .flags(create_info.flags)
+                .image(*create_info.image.raw())
+                .view_type(create_info.view_type)
+                .format(create_info.format)
+                .components(create_info.components)
+                .subresource_range(create_info.subresource_range);
+            self.loader
+                .create_image_view(&builder, None)
+                .result()
+                .map(|v| ImageView::new(v))
+        }
+    }
+
+    /// Destroys an image view object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - All submitted commands that refer to `image_view` must have completed
+    ///   execution.
+    /// - `image_view` must be a handle to an image view object associated with
+    ///   this device.
+    pub unsafe fn destroy_image_view(&self, mut image_view: ImageView) {
+        unsafe {
+            self.loader
+                .destroy_image_view(Some(*image_view.handle_mut().raw_mut()), None)
+        }
+    }
+
     /// Create a swapchain.
     ///
     /// # Safety
@@ -597,6 +637,38 @@ impl Image {
     pub unsafe fn new(raw: vk::Image) -> Image {
         Image { raw }
     }
+}
+
+// ============================================================================
+
+define_sync_handle! {
+    /// An opaque handle to a Vulkan image view object.
+    pub struct ImageView(vk::ImageView);
+}
+
+impl ImageView {
+    /// Constructs a new `Image` which owns the image view associated with the
+    /// raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `ImageView` object.
+    /// // TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::ImageView) -> ImageView {
+        ImageView { raw }
+    }
+}
+
+pub struct ImageViewCreateInfo<'img> {
+    pub flags: vk::ImageViewCreateFlags,
+    pub image: Handle<'img, vk::Image>,
+    pub view_type: vk::ImageViewType,
+    pub format: vk::Format,
+    pub components: vk::ComponentMapping,
+    pub subresource_range: vk::ImageSubresourceRange,
 }
 
 // ============================================================================
