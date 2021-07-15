@@ -3,7 +3,7 @@ use std::cmp;
 use erupt::vk;
 
 use crate::{
-    vks::{self, VkObject, VkSyncObject},
+    vks::{self, VkObject},
     Device,
 };
 
@@ -24,8 +24,8 @@ pub struct Display {
 
     image_views: Vec<vks::ImageView>,
     images: Vec<vks::Image>,
-    swapchain: Option<vks::Swapchain>,
-    surface: Option<vks::Surface>,
+    swapchain: Option<vks::SwapchainKHR>,
+    surface: Option<vks::SurfaceKHR>,
     device: Device,
 }
 
@@ -64,7 +64,7 @@ impl Display {
     // Safety: device and surface must be from same instance
     pub unsafe fn create(
         device: &Device,
-        mut surface: vks::Surface,
+        mut surface: vks::SurfaceKHR,
         phys_window_extent: vk::Extent2D,
     ) -> Display {
         let device_read = device.inner.read();
@@ -76,9 +76,9 @@ impl Display {
 
             let surface_supported = instance_handle
                 .get_physical_device_surface_support_khr(
-                    phys.handle(),
+                    &phys,
                     device.present_family_id(),
-                    surface.handle(),
+                    &surface,
                 )
                 .expect("failed to verify physical device surface support");
 
@@ -88,13 +88,13 @@ impl Display {
 
             (
                 instance_handle
-                    .get_physical_device_surface_capabilities_khr(phys.handle(), surface.handle())
+                    .get_physical_device_surface_capabilities_khr(phys, &surface)
                     .expect("failed to query surface capabilities"),
                 instance_handle
-                    .get_physical_device_surface_formats_khr(phys.handle(), surface.handle())
+                    .get_physical_device_surface_formats_khr(phys, &surface)
                     .expect("failed to query surface formats"),
                 instance_handle
-                    .get_physical_device_surface_present_modes_khr(phys.handle(), surface.handle())
+                    .get_physical_device_surface_present_modes_khr(phys, &surface)
                     .expect("failed to query surface presentation modes"),
             )
         };
@@ -148,7 +148,7 @@ impl Display {
 
         let mut create_info = vks::SwapchainCreateInfo {
             flags: vk::SwapchainCreateFlagsKHR::empty(),
-            surface: surface.handle_mut(),
+            surface: &mut surface,
             min_image_count,
             image_format: surface_format.format,
             image_color_space: surface_format.color_space,
@@ -164,12 +164,12 @@ impl Display {
             old_swapchain: None,
         };
 
-        let swapchain = unsafe { device_read.raw.create_swapchain(&mut create_info) }
+        let swapchain = unsafe { device_read.raw.create_swapchain_khr(&mut create_info) }
             .expect("failed to create swapchain");
 
         log::info!("Successfully created swapchain.");
 
-        let images = unsafe { device_read.raw.get_swapchain_images_khr(swapchain.handle()) }
+        let images = unsafe { device_read.raw.get_swapchain_images_khr(&swapchain) }
             .expect("failed to get swapchain images");
 
         let image_views = images
@@ -179,7 +179,7 @@ impl Display {
                     .raw
                     .create_image_view(&vks::ImageViewCreateInfo {
                         flags: vk::ImageViewCreateFlags::empty(),
-                        image: img.handle(),
+                        image: &img,
                         view_type: vk::ImageViewType::_2D,
                         format: surface_format.format,
                         components: vk::ComponentMapping {

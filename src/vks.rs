@@ -2,10 +2,10 @@
 //!
 //! This module provides zero-cost wrappers for Vulkan objects and functions
 //! which eliminate certain invalid usages of the API without incurring runtime
-//! overhead. In particular, the `Handle` and `HandleMut` types are used to
+//! overhead. In particular, Rust's ownership and borrowing rules are used to
 //! enforce Vulkan's external synchronization rules: functions which require
-//! that a parameter be externally synchronized accept a `HandleMut`, which may
-//! not be obtained without exclusive access to the object.
+//! that a parameter be externally synchronized accept the object type either by
+//! mutable reference or by value (in case the function may destroy the object).
 
 use erupt::{vk, DeviceLoader, EntryLoader, InstanceLoader, LoaderError};
 
@@ -24,8 +24,8 @@ pub type VkResult<T> = std::result::Result<T, vk::Result>;
 /// A Vulkan API object.
 ///
 /// This trait represents a Vulkan object. Types which implement this trait have
-/// exclusive ownership of a Vulkan object and may allow use of the object via
-/// the `handle` method.
+/// exclusive ownership of a Vulkan object and may allow shared use of the
+/// object via the `handle` method or exclusive use via the `handle_mut` method.
 ///
 /// # Safety
 ///
@@ -35,43 +35,12 @@ pub type VkResult<T> = std::result::Result<T, vk::Result>;
 ///   `Clone`), duplicating the value must not duplicate the underlying raw
 ///   handle.
 /// - The raw handle owned by values of the implementing type must not be
-///   accessible except through the `handle` trait method or the `handle_mut`
-///   method on `VkSyncObject`, which extends this trait.
+///   accessible except via the `handle` or `handle_mut` trait methods.
 pub unsafe trait VkObject {
     /// The raw handle type.
-    type Raw;
+    type Handle;
 
-    /// Returns a `Handle` to the underlying Vulkan object.
-    fn handle<'a>(&'a self) -> Handle<'a, Self::Raw>;
-}
-
-/// A Vulkan API object which has external synchronization requirements.
-///
-/// This trait extends `VkObject` to represent Vulkan objects that require
-/// external synchronization during at least one Vulkan API call.
-///
-/// # Safety
-///
-/// Implementors of this trait must uphold the following invariants:
-/// - The implementing type must not implement `Copy`.
-/// - If a value of the implementing type can be duplicated (e.g., if the type is
-///   `Clone`), duplicating the value must not duplicate the underlying raw
-///   handle.
-/// - The raw handle owned by values of the implementing type must not be
-///   accessible except through the `handle_mut` trait method or the `handle`
-///   method on `VkObject`, which is extended by this trait.
-pub unsafe trait VkSyncObject: VkObject {
-    /// Returns a `HandleMut` to the underlying Vulkan object.
-    fn handle_mut<'a>(&'a mut self) -> HandleMut<'a, Self::Raw>;
-}
-
-/// A handle to a Vulkan object which does not guarantee external synchronization.
-pub struct Handle<'a, T> {
-    raw: &'a T,
-}
-
-impl<'a, T> Handle<'a, T> {
-    /// Returns a raw handle to the associated Vulkan object.
+    /// Returns a reference to the underlying Vulkan object.
     ///
     /// # Safety
     ///
@@ -79,29 +48,18 @@ impl<'a, T> Handle<'a, T> {
     /// - The raw handle must not be used as a parameter in any Vulkan API call
     ///   which specifies an external synchronization requirement on that
     ///   parameter.
-    /// - No copy of the returned raw handle may outlive the `Handle` value.
-    #[inline(always)]
-    pub(crate) unsafe fn raw(&self) -> &T {
-        self.raw
-    }
-}
+    /// - No copy of the returned raw handle may be used in any Vulkan API call
+    ///   once the borrow expires.
+    unsafe fn handle(&self) -> &Self::Handle;
 
-/// A handle to a Vulkan object which guarantees external synchronization.
-pub struct HandleMut<'a, T> {
-    raw: &'a mut T,
-}
-
-impl<'a, T> HandleMut<'a, T> {
-    /// Returns a raw handle to the associated Vulkan object.
+    /// Returns a mutable reference to the underlying Vulkan object.
     ///
     /// # Safety
     ///
     /// The caller must uphold the following invariants:
-    /// - No copy of the returned raw handle may outlive the `Handle` value.
-    #[inline(always)]
-    pub(crate) unsafe fn raw_mut(&self) -> &T {
-        self.raw
-    }
+    /// - No copy of the returned raw handle may be used in any Vulkan API call
+    ///   once the mutable borrow expires.
+    unsafe fn handle_mut(&mut self) -> &mut Self::Handle;
 }
 
 /// A macro to define a wrapper type around a raw Vulkan handle and implement
@@ -114,29 +72,16 @@ macro_rules! define_handle {
         }
 
         unsafe impl VkObject for $defty {
-            type Raw = $raw;
+            type Handle = $raw;
 
             #[inline(always)]
-            fn handle<'a>(&'a self) -> Handle<'a, Self::Raw> {
-                Handle { raw: &self.raw }
+            unsafe fn handle(&self) -> &Self::Handle {
+                &self.raw
             }
-        }
-    };
-}
 
-/// A macro to define a wrapper type around a raw Vulkan handle and implement
-/// `VkObject` and `VkSyncObject` for the wrapper type.
-macro_rules! define_sync_handle {
-    ($(#[$outer:meta])? $v:vis struct $defty:ident($raw:ty);) => {
-        define_handle! {
-            $(#[$outer])?
-            $v struct $defty($raw);
-        }
-
-        unsafe impl VkSyncObject for $defty {
             #[inline(always)]
-            fn handle_mut<'a>(&'a mut self) -> HandleMut<'a, Self::Raw> {
-                HandleMut { raw: &mut self.raw }
+            unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
+                &mut self.raw
             }
         }
     };
@@ -159,18 +104,14 @@ impl Drop for Instance {
 }
 
 unsafe impl VkObject for Instance {
-    type Raw = InstanceLoader;
+    type Handle = InstanceLoader;
 
-    fn handle<'a>(&'a self) -> Handle<'a, Self::Raw> {
-        Handle { raw: &self.loader }
+    unsafe fn handle(&self) -> &Self::Handle {
+        &self.loader
     }
-}
 
-unsafe impl VkSyncObject for Instance {
-    fn handle_mut<'a>(&'a mut self) -> HandleMut<'a, Self::Raw> {
-        HandleMut {
-            raw: &mut self.loader,
-        }
+    unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
+        &mut self.loader
     }
 }
 
@@ -207,9 +148,12 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_features(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
+        phys_device: &PhysicalDevice,
     ) -> vk::PhysicalDeviceFeatures {
-        unsafe { self.loader.get_physical_device_features(*phys_device.raw()) }
+        unsafe {
+            self.loader
+                .get_physical_device_features(*phys_device.handle())
+        }
     }
 
     /// Returns properties of a physical device.
@@ -222,11 +166,11 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_properties(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
+        phys_device: &PhysicalDevice,
     ) -> vk::PhysicalDeviceProperties {
         unsafe {
             self.loader
-                .get_physical_device_properties(*phys_device.raw())
+                .get_physical_device_properties(*phys_device.handle())
         }
     }
 
@@ -240,11 +184,11 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_queue_family_properties(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
+        phys_device: &PhysicalDevice,
     ) -> Vec<vk::QueueFamilyProperties> {
         unsafe {
             self.loader
-                .get_physical_device_queue_family_properties(*phys_device.raw(), None)
+                .get_physical_device_queue_family_properties(*phys_device.handle(), None)
         }
     }
 
@@ -259,16 +203,16 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_surface_support_khr(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
+        phys_device: &PhysicalDevice,
         queue_family_index: u32,
-        surface: Handle<'_, vk::SurfaceKHR>,
+        surface: &SurfaceKHR,
     ) -> VkResult<bool> {
         unsafe {
             self.loader
                 .get_physical_device_surface_support_khr(
-                    *phys_device.raw(),
+                    *phys_device.handle(),
                     queue_family_index,
-                    *surface.raw(),
+                    *surface.handle(),
                 )
                 .result()
         }
@@ -285,12 +229,15 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_surface_capabilities_khr(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
-        surface: Handle<'_, vk::SurfaceKHR>,
+        phys_device: &PhysicalDevice,
+        surface: &SurfaceKHR,
     ) -> VkResult<vk::SurfaceCapabilitiesKHR> {
         unsafe {
             self.loader
-                .get_physical_device_surface_capabilities_khr(*phys_device.raw(), *surface.raw())
+                .get_physical_device_surface_capabilities_khr(
+                    *phys_device.handle(),
+                    *surface.handle(),
+                )
                 .result()
         }
     }
@@ -306,12 +253,16 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_surface_formats_khr(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
-        surface: Handle<'_, vk::SurfaceKHR>,
+        phys_device: &PhysicalDevice,
+        surface: &SurfaceKHR,
     ) -> VkResult<Vec<vk::SurfaceFormatKHR>> {
         unsafe {
             self.loader
-                .get_physical_device_surface_formats_khr(*phys_device.raw(), *surface.raw(), None)
+                .get_physical_device_surface_formats_khr(
+                    *phys_device.handle(),
+                    *surface.handle(),
+                    None,
+                )
                 .result()
         }
     }
@@ -327,14 +278,14 @@ impl Instance {
     #[inline]
     pub unsafe fn get_physical_device_surface_present_modes_khr(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
-        surface: Handle<'_, vk::SurfaceKHR>,
+        phys_device: &PhysicalDevice,
+        surface: &SurfaceKHR,
     ) -> VkResult<Vec<vk::PresentModeKHR>> {
         unsafe {
             self.loader
                 .get_physical_device_surface_present_modes_khr(
-                    *phys_device.raw(),
-                    *surface.raw(),
+                    *phys_device.handle(),
+                    *surface.handle(),
                     None,
                 )
                 .result()
@@ -351,11 +302,11 @@ impl Instance {
     #[inline]
     pub unsafe fn create_device(
         &self,
-        phys_device: Handle<'_, vk::PhysicalDevice>,
+        phys_device: &PhysicalDevice,
         create_info: &vk::DeviceCreateInfo,
     ) -> Result<Device, LoaderError> {
         unsafe {
-            let loader = DeviceLoader::new(&self.loader, *phys_device.raw(), create_info, None)?;
+            let loader = DeviceLoader::new(&self.loader, *phys_device.handle(), create_info, None)?;
             Ok(Device::new(loader))
         }
     }
@@ -364,35 +315,32 @@ impl Instance {
     pub unsafe fn create_debug_utils_messenger(
         &self,
         info: &vk::DebugUtilsMessengerCreateInfoEXT,
-    ) -> VkResult<DebugMessenger> {
+    ) -> VkResult<DebugUtilsMessengerEXT> {
         unsafe {
             let debug_messenger = self
                 .loader
                 .create_debug_utils_messenger_ext(info, None)
                 .result()?;
 
-            Ok(DebugMessenger::new(debug_messenger))
+            Ok(DebugUtilsMessengerEXT::new(debug_messenger))
         }
     }
 
-    pub unsafe fn destroy_debug_utils_messenger(
-        &self,
-        messenger: HandleMut<'_, vk::DebugUtilsMessengerEXT>,
-    ) {
+    pub unsafe fn destroy_debug_utils_messenger(&self, mut messenger: DebugUtilsMessengerEXT) {
         // Safety:
-        // - Access to debug messenger is externally synchronized via `HandleMut`.
+        // - Access to debug messenger is externally synchronized via ownership.
         unsafe {
             self.loader
-                .destroy_debug_utils_messenger_ext(Some(*messenger.raw_mut()), None);
+                .destroy_debug_utils_messenger_ext(Some(*messenger.handle_mut()), None);
         }
     }
 
-    pub unsafe fn destroy_surface(&self, mut surface: Surface) {
+    pub unsafe fn destroy_surface(&self, mut surface: SurfaceKHR) {
         // Safety:
         // - Access to surface is externally synchronized via ownership.
         unsafe {
             self.loader
-                .destroy_surface_khr(Some(*surface.handle_mut().raw_mut()), None);
+                .destroy_surface_khr(Some(*surface.handle_mut()), None);
         }
     }
 }
@@ -435,18 +383,14 @@ impl Drop for Device {
 }
 
 unsafe impl VkObject for Device {
-    type Raw = DeviceLoader;
+    type Handle = DeviceLoader;
 
-    fn handle<'a>(&'a self) -> Handle<'a, Self::Raw> {
-        Handle { raw: &self.loader }
+    unsafe fn handle(&self) -> &Self::Handle {
+        &self.loader
     }
-}
 
-unsafe impl VkSyncObject for Device {
-    fn handle_mut<'a>(&'a mut self) -> HandleMut<'a, Self::Raw> {
-        HandleMut {
-            raw: &mut self.loader,
-        }
+    unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
+        &mut self.loader
     }
 }
 
@@ -471,7 +415,7 @@ impl Device {
         unsafe {
             let builder = vk::ImageViewCreateInfoBuilder::new()
                 .flags(create_info.flags)
-                .image(*create_info.image.raw())
+                .image(*create_info.image.handle())
                 .view_type(create_info.view_type)
                 .format(create_info.format)
                 .components(create_info.components)
@@ -495,7 +439,36 @@ impl Device {
     pub unsafe fn destroy_image_view(&self, mut image_view: ImageView) {
         unsafe {
             self.loader
-                .destroy_image_view(Some(*image_view.handle_mut().raw_mut()), None)
+                .destroy_image_view(Some(*image_view.handle_mut()), None)
+        }
+    }
+
+    /// Creates a new shader module object.
+    ///
+    /// # Safety
+    ///
+    /// - TODO: must destroy before destroying parent device
+    pub unsafe fn create_shader_module(
+        &self,
+        create_info: &vk::ShaderModuleCreateInfo,
+    ) -> VkResult<ShaderModule> {
+        unsafe {
+            self.loader
+                .create_shader_module(create_info, None)
+                .result()
+                .map(|sm| ShaderModule::new(sm))
+        }
+    }
+
+    /// Destroys a shader module.
+    ///
+    /// # Safety
+    ///
+    /// - `module` must be a shader module created by this device.
+    pub unsafe fn destroy_shader_module(&self, mut module: ShaderModule) {
+        unsafe {
+            self.loader
+                .destroy_shader_module(Some(*module.handle_mut()), None);
         }
     }
 
@@ -512,15 +485,15 @@ impl Device {
     ///   handle to a non-retired swapchain associated with
     ///   `create_info.surface`.
     #[inline]
-    pub unsafe fn create_swapchain(
+    pub unsafe fn create_swapchain_khr(
         &self,
         create_info: &mut SwapchainCreateInfo<'_, '_>,
-    ) -> VkResult<Swapchain> {
+    ) -> VkResult<SwapchainKHR> {
         unsafe {
             let raw_create_info = vk::SwapchainCreateInfoKHRBuilder::new()
                 .flags(create_info.flags)
-                // Safety: surface is externally synchronized via `HandleMut`.
-                .surface(*create_info.surface.raw_mut())
+                // Safety: surface is externally synchronized via mutable borrow.
+                .surface(*create_info.surface.handle_mut())
                 .min_image_count(create_info.min_image_count)
                 .image_format(create_info.image_format)
                 .image_color_space(create_info.image_color_space)
@@ -533,12 +506,12 @@ impl Device {
                 .composite_alpha(create_info.composite_alpha)
                 .present_mode(create_info.present_mode)
                 .clipped(create_info.clipped)
-                // Safety: old swapchain, if any, is externally synchronized via `HandleMut`.
+                // Safety: old swapchain, if any, is externally synchronized via ownership.
                 .old_swapchain(
                     create_info
                         .old_swapchain
                         .take()
-                        .map(|mut os| *os.handle_mut().raw_mut())
+                        .map(|mut os| *os.handle_mut())
                         .unwrap_or(vk::SwapchainKHR::null()),
                 );
 
@@ -547,7 +520,7 @@ impl Device {
                 .create_swapchain_khr(&raw_create_info, None)
                 .result()?;
 
-            Ok(Swapchain::new(swapchain))
+            Ok(SwapchainKHR::new(swapchain))
         }
     }
 
@@ -557,12 +530,12 @@ impl Device {
     ///
     /// The caller must uphold the following invariants:
     /// - `swapchain` must be a swapchain object associated with this instance.
-    pub unsafe fn destroy_swapchain(&self, mut swapchain: Swapchain) {
+    pub unsafe fn destroy_swapchain(&self, mut swapchain: SwapchainKHR) {
         unsafe {
             // Safety:
             // - `swapchain` is externally synchronized, as it is received by value.
             self.loader
-                .destroy_swapchain_khr(Some(*swapchain.handle_mut().raw_mut()), None);
+                .destroy_swapchain_khr(Some(*swapchain.handle_mut()), None);
         }
     }
 
@@ -576,12 +549,12 @@ impl Device {
     #[inline]
     pub unsafe fn get_swapchain_images_khr(
         &self,
-        swapchain: Handle<'_, vk::SwapchainKHR>,
+        swapchain: &SwapchainKHR,
     ) -> VkResult<Vec<Image>> {
         unsafe {
             Ok(self
                 .loader
-                .get_swapchain_images_khr(*swapchain.raw(), None)
+                .get_swapchain_images_khr(*swapchain.handle(), None)
                 .result()?
                 .into_iter()
                 .map(|img| Image::new(img))
@@ -592,7 +565,7 @@ impl Device {
 
 // ============================================================================
 
-define_sync_handle! {
+define_handle! {
     /// An opaque handle to a Vulkan queue object.
     pub struct Queue(vk::Queue);
 }
@@ -615,7 +588,7 @@ impl Queue {
 
 // ============================================================================
 
-define_sync_handle! {
+define_handle! {
     /// An opaque handle to a Vulkan image object.
     pub struct Image(vk::Image);
 }
@@ -641,7 +614,7 @@ impl Image {
 
 // ============================================================================
 
-define_sync_handle! {
+define_handle! {
     /// An opaque handle to a Vulkan image view object.
     pub struct ImageView(vk::ImageView);
 }
@@ -664,7 +637,7 @@ impl ImageView {
 
 pub struct ImageViewCreateInfo<'img> {
     pub flags: vk::ImageViewCreateFlags,
-    pub image: Handle<'img, vk::Image>,
+    pub image: &'img Image,
     pub view_type: vk::ImageViewType,
     pub format: vk::Format,
     pub components: vk::ComponentMapping,
@@ -673,12 +646,35 @@ pub struct ImageViewCreateInfo<'img> {
 
 // ============================================================================
 
-define_sync_handle! {
-    /// An opaque handle to a Vulkan surface object.
-    pub struct Surface(vk::SurfaceKHR);
+define_handle! {
+    /// An opaque handle to a Vulkan shader module.
+    pub struct ShaderModule(vk::ShaderModule);
 }
 
-impl Surface {
+impl ShaderModule {
+    /// Constructs a new `ShaderModule` which owns the shader module associated
+    /// with the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `ShaderModule` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::ShaderModule) -> ShaderModule {
+        ShaderModule { raw }
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan surface object.
+    pub struct SurfaceKHR(vk::SurfaceKHR);
+}
+
+impl SurfaceKHR {
     /// Constructs a new `Surface` which owns the surface associated with the
     /// raw handle `raw`.
     ///
@@ -689,19 +685,19 @@ impl Surface {
     ///   this constructor is called.
     /// - `raw` must not be used to create another `Surface` object.
     /// - TODO: must be destroyed before instance is destroyed
-    pub unsafe fn new(raw: vk::SurfaceKHR) -> Surface {
-        Surface { raw }
+    pub unsafe fn new(raw: vk::SurfaceKHR) -> SurfaceKHR {
+        SurfaceKHR { raw }
     }
 }
 
 // ============================================================================
 
-define_sync_handle! {
+define_handle! {
     /// An opaque handle to a Vulkan swapchain object.
-    pub struct Swapchain(vk::SwapchainKHR);
+    pub struct SwapchainKHR(vk::SwapchainKHR);
 }
 
-impl Swapchain {
+impl SwapchainKHR {
     /// Constructs a new `Swapchain` which owns the swapchain associated with
     /// the raw handle `raw`.
     ///
@@ -711,14 +707,14 @@ impl Swapchain {
     /// - `raw` must not be used as a parameter to any Vulkan API call after
     ///   this constructor is called.
     /// - `raw` must not be used to create another `Swapchain` object.
-    pub unsafe fn new(raw: vk::SwapchainKHR) -> Swapchain {
-        Swapchain { raw }
+    pub unsafe fn new(raw: vk::SwapchainKHR) -> SwapchainKHR {
+        SwapchainKHR { raw }
     }
 }
 
 pub struct SwapchainCreateInfo<'surf, 'queues> {
     pub flags: vk::SwapchainCreateFlagsKHR,
-    pub surface: HandleMut<'surf, vk::SurfaceKHR>,
+    pub surface: &'surf mut SurfaceKHR,
     pub min_image_count: u32,
     pub image_format: vk::Format,
     pub image_color_space: vk::ColorSpaceKHR,
@@ -731,16 +727,16 @@ pub struct SwapchainCreateInfo<'surf, 'queues> {
     pub composite_alpha: vk::CompositeAlphaFlagBitsKHR,
     pub present_mode: vk::PresentModeKHR,
     pub clipped: bool,
-    pub old_swapchain: Option<Swapchain>,
+    pub old_swapchain: Option<SwapchainKHR>,
 }
 
 // ============================================================================
 
-define_sync_handle! {
-    pub struct DebugMessenger(vk::DebugUtilsMessengerEXT);
+define_handle! {
+    pub struct DebugUtilsMessengerEXT(vk::DebugUtilsMessengerEXT);
 }
 
-impl DebugMessenger {
+impl DebugUtilsMessengerEXT {
     /// Constructs a new `DebugMessenger` which owns the debug utils messenger
     /// associated with the raw handle `raw`.
     ///
@@ -751,8 +747,8 @@ impl DebugMessenger {
     ///   this constructor is called.
     /// - `raw` must not be used to create another `DebugMessenger` object.
     /// - TODO: must be destroyed before instance is destroyed
-    pub unsafe fn new(raw: vk::DebugUtilsMessengerEXT) -> DebugMessenger {
-        DebugMessenger { raw }
+    pub unsafe fn new(raw: vk::DebugUtilsMessengerEXT) -> DebugUtilsMessengerEXT {
+        DebugUtilsMessengerEXT { raw }
     }
 }
 

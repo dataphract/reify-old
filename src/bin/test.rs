@@ -1,6 +1,7 @@
 use erupt::vk;
 use raw_window_handle::HasRawWindowHandle;
 use reify::{Instance, SwapchainCreateInfo};
+use shaderc::{Compiler, ShaderKind};
 use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
@@ -35,6 +36,16 @@ pub fn main() {
             },
         )
     };
+
+    let mut compiler = Compiler::new().expect("failed to initialize shaderc");
+
+    let vert_glsl = include_str!("../../shaders/vert.glsl");
+    let frag_glsl = include_str!("../../shaders/frag.glsl");
+
+    let vert_spv =
+        compiler.compile_into_spirv(vert_glsl, ShaderKind::Vertex, "vert.glsl", "main", None);
+    let frag_spv =
+        compiler.compile_into_spirv(frag_glsl, ShaderKind::Fragment, "frag.glsl", "main", None);
 
     event_loop.run(move |event, _target, flow| match event {
         winit::event::Event::WindowEvent {

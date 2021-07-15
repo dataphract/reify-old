@@ -14,7 +14,7 @@ use arrayvec::ArrayVec;
 use erupt::vk;
 use parking_lot::{RwLock, RwLockReadGuard};
 use raw_window_handle::RawWindowHandle;
-use vks::{VkObject, VkSyncObject};
+use vks::VkObject;
 
 pub use debug_utils::DebugMessenger;
 pub use display::Display;
@@ -242,7 +242,7 @@ impl Instance {
         target_os = "netbsd",
         target_os = "openbsd",
     ))]
-    pub fn create_surface(&self, window: RawWindowHandle) -> vks::Surface {
+    pub fn create_surface(&self, window: RawWindowHandle) -> vks::SurfaceKHR {
         let read_lock = self.inner.read();
 
         let raw_surface = match window {
@@ -256,7 +256,6 @@ impl Instance {
                     read_lock
                         .handle
                         .handle()
-                        .raw()
                         .create_xlib_surface_khr(&create_info, None)
                         .expect("failed to create Xlib window surface")
                 }
@@ -271,7 +270,6 @@ impl Instance {
                     read_lock
                         .handle
                         .handle()
-                        .raw()
                         .create_xcb_surface_khr(&create_info, None)
                         .expect("failed to create XCB window surface")
                 }
@@ -282,7 +280,7 @@ impl Instance {
 
         drop(read_lock);
 
-        unsafe { vks::Surface::new(raw_surface) }
+        unsafe { vks::SurfaceKHR::new(raw_surface) }
     }
 
     #[cfg(not(any(
@@ -296,7 +294,7 @@ impl Instance {
         compile_error!("Unsupported platform (only linux is supported).");
     }
 
-    pub fn enumerate_physical_devices(&self, surface: &vks::Surface) -> Vec<PhysicalDevice> {
+    pub fn enumerate_physical_devices(&self, surface: &vks::SurfaceKHR) -> Vec<PhysicalDevice> {
         let read_lock = self.inner.read();
 
         let devices = match read_lock.handle.enumerate_physical_devices() {
@@ -355,14 +353,14 @@ impl PhysicalDevice {
     unsafe fn new(
         instance: Instance,
         phys_device: vks::PhysicalDevice,
-        surface: &vks::Surface,
+        surface: &vks::SurfaceKHR,
     ) -> PhysicalDevice {
         let read_lock = instance.inner.read();
 
         let queue_families = unsafe {
             read_lock
                 .handle
-                .get_physical_device_queue_family_properties(phys_device.handle())
+                .get_physical_device_queue_family_properties(&phys_device)
         };
 
         enum QueueSelection {
@@ -419,11 +417,7 @@ impl PhysicalDevice {
             if unsafe {
                 read_lock
                     .handle()
-                    .get_physical_device_surface_support_khr(
-                        phys_device.handle(),
-                        index as u32,
-                        surface.handle(),
-                    )
+                    .get_physical_device_surface_support_khr(&phys_device, index as u32, &surface)
                     .expect(&format!(
                         "failed to query queue family {} for surface support",
                         index
@@ -492,7 +486,7 @@ impl PhysicalDevice {
                 .instance
                 .read_inner()
                 .handle
-                .get_physical_device_properties(self.inner.raw.handle())
+                .get_physical_device_properties(&self.inner.raw)
         }
     }
 
@@ -503,7 +497,7 @@ impl PhysicalDevice {
                 .instance
                 .read_inner()
                 .handle
-                .get_physical_device_features(self.inner.raw.handle())
+                .get_physical_device_features(&self.inner.raw)
         }
     }
 
@@ -535,7 +529,7 @@ impl PhysicalDevice {
                 .instance
                 .read_inner()
                 .handle
-                .create_device(self.inner.raw.handle(), &device_create_info)
+                .create_device(&self.inner.raw, &device_create_info)
                 .expect("failed to create logical device")
         };
 
@@ -561,7 +555,6 @@ impl PhysicalDevice {
                     inner_read
                         .raw
                         .handle()
-                        .raw()
                         .get_device_queue(info.queue_family_index, 0),
                 )
             };
@@ -708,7 +701,7 @@ impl Device {
     // Safety: device and surface must be from same instance
     pub unsafe fn create_display(
         &self,
-        surface: vks::Surface,
+        surface: vks::SurfaceKHR,
         phys_window_extent: vk::Extent2D,
     ) -> Display {
         unsafe { Display::create(self, surface, phys_window_extent) }
@@ -734,7 +727,7 @@ pub struct Queue {
 
 struct SurfaceInner {
     instance: Instance,
-    raw: Option<vks::Surface>,
+    raw: Option<vks::SurfaceKHR>,
 }
 
 impl Drop for SurfaceInner {
@@ -778,7 +771,7 @@ pub struct SwapchainCreateInfo {
 
 struct SwapchainInner {
     // NOTE: sensitive drop order.
-    raw: Option<vks::Swapchain>,
+    raw: Option<vks::SwapchainKHR>,
     device: Device,
     surface: Surface,
 }

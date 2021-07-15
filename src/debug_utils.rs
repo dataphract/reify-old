@@ -5,7 +5,7 @@ use std::{
 
 use erupt::vk;
 
-use crate::{vks, Instance, VkSyncObject};
+use crate::{vks, Instance};
 
 fn format_cstr<F, C>(f: &mut F, cstr: C) -> fmt::Result
 where
@@ -215,16 +215,18 @@ fn debug_utils_messenger_callback_impl(
 
 pub struct DebugMessenger {
     instance: Instance,
-    messenger: vks::DebugMessenger,
+    messenger: Option<vks::DebugUtilsMessengerEXT>,
 }
 
 impl Drop for DebugMessenger {
     fn drop(&mut self) {
-        unsafe {
-            self.instance
-                .read_inner()
-                .handle()
-                .destroy_debug_utils_messenger(self.messenger.handle_mut());
+        if let Some(messenger) = self.messenger.take() {
+            unsafe {
+                self.instance
+                    .read_inner()
+                    .handle()
+                    .destroy_debug_utils_messenger(messenger);
+            }
         }
     }
 }
@@ -249,7 +251,7 @@ impl DebugMessenger {
 
         DebugMessenger {
             instance,
-            messenger,
+            messenger: Some(messenger),
         }
     }
 }
