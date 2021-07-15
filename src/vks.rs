@@ -15,7 +15,7 @@ static ENTRY: SyncOnceCell<EntryLoader> = SyncOnceCell::new();
 
 pub fn entry() -> &'static EntryLoader {
     ENTRY
-        .get_or_try_init(|| unsafe { EntryLoader::new() })
+        .get_or_try_init(|| EntryLoader::new())
         .expect("failed to load Vulkan dynamic library")
 }
 
@@ -248,6 +248,32 @@ impl Instance {
         }
     }
 
+    /// Queries is presentation is supported.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `phys_device` must be a physical device handle associated with this
+    ///   instance.
+    /// - `surface` must be a surface handle associated with this instance.
+    #[inline]
+    pub unsafe fn get_physical_device_surface_support_khr(
+        &self,
+        phys_device: Handle<'_, vk::PhysicalDevice>,
+        queue_family_index: u32,
+        surface: Handle<'_, vk::SurfaceKHR>,
+    ) -> VkResult<bool> {
+        unsafe {
+            self.loader
+                .get_physical_device_surface_support_khr(
+                    *phys_device.raw(),
+                    queue_family_index,
+                    *surface.raw(),
+                )
+                .result()
+        }
+    }
+
     /// Queries surface capabilities.
     ///
     /// # Safety
@@ -286,6 +312,31 @@ impl Instance {
         unsafe {
             self.loader
                 .get_physical_device_surface_formats_khr(*phys_device.raw(), *surface.raw(), None)
+                .result()
+        }
+    }
+
+    /// Queries supported presentation modes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `phys_device` must be a physical device handle associated with this
+    ///   instance.
+    /// - `surface` must be a surface handle associated with this instance.
+    #[inline]
+    pub unsafe fn get_physical_device_surface_present_modes_khr(
+        &self,
+        phys_device: Handle<'_, vk::PhysicalDevice>,
+        surface: Handle<'_, vk::SurfaceKHR>,
+    ) -> VkResult<Vec<vk::PresentModeKHR>> {
+        unsafe {
+            self.loader
+                .get_physical_device_surface_present_modes_khr(
+                    *phys_device.raw(),
+                    *surface.raw(),
+                    None,
+                )
                 .result()
         }
     }

@@ -17,6 +17,7 @@ use raw_window_handle::RawWindowHandle;
 use vks::{VkObject, VkSyncObject};
 
 pub use debug_utils::DebugMessenger;
+pub use display::Display;
 
 const LAYER_NAME_VALIDATION: &[u8] = b"VK_LAYER_KHRONOS_validation\0";
 
@@ -115,7 +116,6 @@ impl Instance {
         }
 
         extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION_NAME);
-        extensions.push(vk::KHR_XCB_SURFACE_EXTENSION_NAME);
         extensions.push(vk::EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME);
         extensions.push(vk::KHR_DISPLAY_EXTENSION_NAME);
 
@@ -242,7 +242,7 @@ impl Instance {
         target_os = "netbsd",
         target_os = "openbsd",
     ))]
-    pub fn create_surface(&self, window: RawWindowHandle) -> Surface {
+    pub fn create_surface(&self, window: RawWindowHandle) -> vks::Surface {
         let read_lock = self.inner.read();
 
         let raw_surface = match window {
@@ -282,12 +282,7 @@ impl Instance {
 
         drop(read_lock);
 
-        Surface {
-            inner: Arc::new(RwLock::new(SurfaceInner {
-                instance: self.clone(),
-                raw: Some(unsafe { vks::Surface::new(raw_surface) }),
-            })),
-        }
+        unsafe { vks::Surface::new(raw_surface) }
     }
 
     #[cfg(not(any(
@@ -301,10 +296,10 @@ impl Instance {
         compile_error!("Unsupported platform (only linux is supported).");
     }
 
-    pub fn enumerate_physical_devices(&self, surface: &Surface) -> Vec<PhysicalDevice> {
+    pub fn enumerate_physical_devices(&self, surface: &vks::Surface) -> Vec<PhysicalDevice> {
         let read_lock = self.inner.read();
 
-        let devices = match unsafe { read_lock.handle.enumerate_physical_devices() } {
+        let devices = match read_lock.handle.enumerate_physical_devices() {
             Ok(devices) => devices,
             Err(e) => {
                 log::error!("failed to enumerate physical devices: {}", e);
@@ -318,13 +313,7 @@ impl Instance {
             .into_iter()
             .map(|raw| {
                 // Safety: Physical device handle comes from the correct instance.
-                unsafe {
-                    PhysicalDevice::new(
-                        self.clone(),
-                        raw,
-                        &surface.inner.read().raw.as_ref().expect("Surface is None"),
-                    )
-                }
+                unsafe { PhysicalDevice::new(self.clone(), raw, surface) }
             })
             .collect()
     }
@@ -430,12 +419,10 @@ impl PhysicalDevice {
             if unsafe {
                 read_lock
                     .handle()
-                    .handle()
-                    .raw()
                     .get_physical_device_surface_support_khr(
-                        *phys_device.handle().raw(),
+                        phys_device.handle(),
                         index as u32,
-                        *surface.handle().raw(),
+                        surface.handle(),
                     )
                     .expect(&format!(
                         "failed to query queue family {} for surface support",
@@ -538,7 +525,8 @@ impl PhysicalDevice {
             .flags(vk::DeviceCreateFlags::empty())
             .queue_create_infos(unique_queue_families.infos())
             .enabled_layer_names(enabled_layer_names)
-            .enabled_extension_names(&[])
+            // TODO: need to check ahead of time that this is available
+            .enabled_extension_names(&[vk::KHR_SWAPCHAIN_EXTENSION_NAME])
             .enabled_features(&phys_device_features);
 
         // Safety: no external synchronization requirement.
@@ -561,8 +549,13 @@ impl PhysicalDevice {
 
         let inner_read = inner.read();
 
+        let mut family_ids = ArrayVec::new();
         let mut queues = ArrayVec::new();
-        for info in unique_queue_families.infos() {
+        for (info, id) in unique_queue_families
+            .infos()
+            .into_iter()
+            .zip(unique_queue_families.family_ids.iter())
+        {
             let raw_queue = unsafe {
                 vks::Queue::new(
                     inner_read
@@ -580,12 +573,14 @@ impl PhysicalDevice {
                 })),
             };
 
+            family_ids.push(*id);
             queues.push(queue);
         }
 
         drop(inner_read);
 
         let queues = DeviceQueues {
+            family_ids,
             queues,
             graphics,
             transfer,
@@ -637,11 +632,11 @@ impl<'a> UniqueQueueFamilies<'a> {
 
 #[derive(Clone)]
 struct DeviceQueues {
-    // NOTE: sensitive drop order.
     graphics: u8,
     transfer: u8,
     present: u8,
 
+    family_ids: ArrayVec<u32, MAX_DEVICE_QUEUES>,
     queues: ArrayVec<Queue, MAX_DEVICE_QUEUES>,
 }
 
@@ -650,12 +645,24 @@ impl DeviceQueues {
         self.queues[self.graphics as usize].clone()
     }
 
+    pub fn graphics_family_id(&self) -> u32 {
+        self.family_ids[self.graphics as usize]
+    }
+
     pub fn transfer(&self) -> Queue {
         self.queues[self.transfer as usize].clone()
     }
 
+    pub fn transfer_family_id(&self) -> u32 {
+        self.family_ids[self.transfer as usize]
+    }
+
     pub fn present(&self) -> Queue {
         self.queues[self.present as usize].clone()
+    }
+
+    pub fn present_family_id(&self) -> u32 {
+        self.family_ids[self.present as usize]
     }
 }
 
@@ -678,12 +685,33 @@ impl Device {
         self.queues.graphics()
     }
 
+    pub fn graphics_family_id(&self) -> u32 {
+        self.queues.graphics_family_id()
+    }
+
     pub fn transfer_queue(&self) -> Queue {
         self.queues.transfer()
     }
 
+    pub fn transfer_family_id(&self) -> u32 {
+        self.queues.transfer_family_id()
+    }
+
     pub fn present_queue(&self) -> Queue {
         self.queues.present()
+    }
+
+    pub fn present_family_id(&self) -> u32 {
+        self.queues.present_family_id()
+    }
+
+    // Safety: device and surface must be from same instance
+    pub unsafe fn create_display(
+        &self,
+        surface: vks::Surface,
+        phys_window_extent: vk::Extent2D,
+    ) -> Display {
+        unsafe { Display::create(self, surface, phys_window_extent) }
     }
 }
 
