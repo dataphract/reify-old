@@ -175,27 +175,26 @@ impl Display {
         let image_views = images
             .iter()
             .map(|img| unsafe {
-                device_read
-                    .raw
-                    .create_image_view(&vks::ImageViewCreateInfo {
-                        flags: vk::ImageViewCreateFlags::empty(),
-                        image: &img,
-                        view_type: vk::ImageViewType::_2D,
-                        format: surface_format.format,
-                        components: vk::ComponentMapping {
+                device_read.raw.create_image_view(
+                    &vks::ImageViewCreateInfoBuilder::new()
+                        .flags(vk::ImageViewCreateFlags::empty())
+                        .image(img)
+                        .view_type(vk::ImageViewType::_2D)
+                        .format(surface_format.format)
+                        .components(vk::ComponentMapping {
                             r: vk::ComponentSwizzle::IDENTITY,
                             g: vk::ComponentSwizzle::IDENTITY,
                             b: vk::ComponentSwizzle::IDENTITY,
                             a: vk::ComponentSwizzle::IDENTITY,
-                        },
-                        subresource_range: vk::ImageSubresourceRange {
+                        })
+                        .subresource_range(vk::ImageSubresourceRange {
                             aspect_mask: vk::ImageAspectFlags::COLOR,
                             base_mip_level: 0,
                             level_count: 1,
                             base_array_layer: 0,
                             layer_count: 1,
-                        },
-                    })
+                        }),
+                )
             })
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

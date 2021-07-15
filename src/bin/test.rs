@@ -42,10 +42,12 @@ pub fn main() {
     let vert_glsl = include_str!("../../shaders/vert.glsl");
     let frag_glsl = include_str!("../../shaders/frag.glsl");
 
-    let vert_spv =
-        compiler.compile_into_spirv(vert_glsl, ShaderKind::Vertex, "vert.glsl", "main", None);
-    let frag_spv =
-        compiler.compile_into_spirv(frag_glsl, ShaderKind::Fragment, "frag.glsl", "main", None);
+    let vert_spv = compiler
+        .compile_into_spirv(vert_glsl, ShaderKind::Vertex, "vert.glsl", "main", None)
+        .unwrap();
+    let frag_spv = compiler
+        .compile_into_spirv(frag_glsl, ShaderKind::Fragment, "frag.glsl", "main", None)
+        .unwrap();
 
     event_loop.run(move |event, _target, flow| match event {
         winit::event::Event::WindowEvent {

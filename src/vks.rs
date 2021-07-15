@@ -87,6 +87,55 @@ macro_rules! define_handle {
     };
 }
 
+// TODO: Unclear if there's an ergonomic way to delegate builder methods from
+// &[&VkObject] to &[VkObject::Handle]. It would probably require builders to be
+// self-referential, which is not great.
+/// Defines a builder struct which delegates the selected methods to an `erupt`
+/// builder.
+///
+/// This allows `VkObject`'s borrowing semantics to integrate with builders
+/// without fully rewriting every struct.
+macro_rules! define_delegated_builder {
+    (
+        $(#[$outer_meta:meta])*
+        $ty_vis:vis struct $typename:ident<'a> {
+            inner: vk::$typename2:ident<'a>,
+        }
+
+        impl $typename3:ident {
+            $(
+                $(#[$method_meta:meta])*
+                $method_vis:vis fn $method_name:ident($method_arg:ty) -> Self;
+            )*
+        }
+    ) => {
+        $(#[$outer_meta])*
+        $ty_vis struct $typename<'a> {
+            inner: vk::$typename<'a>,
+        }
+
+        impl<'a> $typename2<'a> {
+            pub fn new() -> Self {
+                Self {
+                    inner: vk::$typename::new(),
+                }
+            }
+
+            pub fn into_inner(self) -> vk::$typename<'a> {
+                self.inner
+            }
+
+            $(
+                $(#[$method_meta])*
+                $method_vis fn $method_name(mut self, $method_name: $method_arg) -> Self {
+                    self.inner = self.inner.$method_name($method_name);
+                    self
+                }
+            )*
+        }
+    };
+}
+
 // ============================================================================
 
 pub struct Instance {
@@ -410,18 +459,11 @@ impl Device {
     /// // TODO
     pub unsafe fn create_image_view(
         &self,
-        create_info: &ImageViewCreateInfo,
+        create_info: &ImageViewCreateInfoBuilder<'_>,
     ) -> VkResult<ImageView> {
         unsafe {
-            let builder = vk::ImageViewCreateInfoBuilder::new()
-                .flags(create_info.flags)
-                .image(*create_info.image.handle())
-                .view_type(create_info.view_type)
-                .format(create_info.format)
-                .components(create_info.components)
-                .subresource_range(create_info.subresource_range);
             self.loader
-                .create_image_view(&builder, None)
+                .create_image_view(&create_info.inner, None)
                 .result()
                 .map(|v| ImageView::new(v))
         }
@@ -635,13 +677,25 @@ impl ImageView {
     }
 }
 
-pub struct ImageViewCreateInfo<'img> {
-    pub flags: vk::ImageViewCreateFlags,
-    pub image: &'img Image,
-    pub view_type: vk::ImageViewType,
-    pub format: vk::Format,
-    pub components: vk::ComponentMapping,
-    pub subresource_range: vk::ImageSubresourceRange,
+define_delegated_builder! {
+    pub struct ImageViewCreateInfoBuilder<'a> {
+        inner: vk::ImageViewCreateInfoBuilder<'a>,
+    }
+
+    impl ImageViewCreateInfoBuilder {
+        pub fn flags(vk::ImageViewCreateFlags) -> Self;
+        pub fn view_type(vk::ImageViewType) -> Self;
+        pub fn format(vk::Format) -> Self;
+        pub fn components(vk::ComponentMapping) -> Self;
+        pub fn subresource_range(vk::ImageSubresourceRange) -> Self;
+    }
+}
+
+impl<'a> ImageViewCreateInfoBuilder<'a> {
+    pub fn image(mut self, image: &'a Image) -> Self {
+        self.inner = self.inner.image(unsafe { *image.handle() });
+        self
+    }
 }
 
 // ============================================================================
@@ -664,6 +718,173 @@ impl ShaderModule {
     /// - TODO: destroy before parent device is destroyed
     pub unsafe fn new(raw: vk::ShaderModule) -> ShaderModule {
         ShaderModule { raw }
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a sampler object.
+    pub struct Sampler(vk::Sampler);
+}
+
+impl Sampler {
+    /// Constructs a new `Sampler` which owns the sampler object associated with
+    /// the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    ///
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `Sampler` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::Sampler) -> Sampler {
+        Sampler { raw }
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a descriptor set layout object.
+    pub struct DescriptorSetLayout(vk::DescriptorSetLayout);
+}
+
+impl DescriptorSetLayout {
+    /// Constructs a new `DescriptorSetLayout` which owns the descriptor set
+    /// layout object associated with the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    ///
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `DescriptorSetLayout` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::DescriptorSetLayout) -> DescriptorSetLayout {
+        DescriptorSetLayout { raw }
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a pipeline layout object.
+    pub struct PipelineLayout(vk::PipelineLayout);
+}
+
+impl PipelineLayout {
+    /// Constructs a new `PipelineLayout` which owns the pipeline layout object
+    /// associated with the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    ///
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `PipelineLayout` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::PipelineLayout) -> PipelineLayout {
+        PipelineLayout { raw }
+    }
+}
+
+pub struct PipelineLayoutCreateInfo<'a> {
+    flags: vk::PipelineLayoutCreateFlags,
+    set_layouts: &'a [&'a DescriptorSetLayout],
+    push_constant_ranges: &'a [vk::PushConstantRange],
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a render pass object.
+    pub struct RenderPass(vk::RenderPass);
+}
+
+impl RenderPass {
+    /// Constructs a new `RenderPass` which owns the render pass object
+    /// associated with the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    ///
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `RenderPass` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::RenderPass) -> RenderPass {
+        RenderPass { raw }
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan pipeline object.
+    pub struct Pipeline(vk::Pipeline);
+}
+
+impl Pipeline {
+    /// Constructs a new `Pipeline` which owns the pipeline object associated
+    /// with the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    ///
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `Pipeline` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::Pipeline) -> Pipeline {
+        Pipeline { raw }
+    }
+}
+
+define_delegated_builder! {
+    pub struct GraphicsPipelineCreateInfoBuilder<'a> {
+        inner: vk::GraphicsPipelineCreateInfoBuilder<'a>,
+    }
+
+    impl GraphicsPipelineCreateInfoBuilder {
+        pub fn flags(vk::PipelineCreateFlags) -> Self;
+        pub fn stages(&'a [vk::PipelineShaderStageCreateInfoBuilder<'a>]) -> Self;
+        pub fn vertex_input_state(&'a vk::PipelineVertexInputStateCreateInfo) -> Self;
+        pub fn input_assembly_state(&'a vk::PipelineInputAssemblyStateCreateInfo) -> Self;
+        pub fn tessellation_state(&'a vk::PipelineTessellationStateCreateInfo) -> Self;
+        pub fn viewport_state(&'a vk::PipelineViewportStateCreateInfo) -> Self;
+        pub fn rasterization_state(&'a vk::PipelineRasterizationStateCreateInfo) -> Self;
+        pub fn multisample_state(&'a vk::PipelineMultisampleStateCreateInfo) -> Self;
+        pub fn depth_stencil_state(&'a vk::PipelineDepthStencilStateCreateInfo) -> Self;
+        pub fn color_blend_state(&'a vk::PipelineColorBlendStateCreateInfo) -> Self;
+        pub fn dynamic_state(&'a vk::PipelineDynamicStateCreateInfo) -> Self;
+        pub fn subpass(u32) -> Self;
+        pub fn base_pipeline_index(i32) -> Self;
+    }
+}
+
+impl<'a> GraphicsPipelineCreateInfoBuilder<'a> {
+    pub fn layout(mut self, layout: &'a PipelineLayout) -> Self {
+        self.inner = self.inner.layout(unsafe { *layout.handle() });
+        self
+    }
+
+    pub fn render_pass(mut self, render_pass: &'a RenderPass) -> Self {
+        self.inner = self.inner.render_pass(unsafe { *render_pass.handle() });
+        self
+    }
+
+    pub fn base_pipeline_handle(mut self, base_pipeline_handle: &'a Pipeline) -> Self {
+        self.inner = self
+            .inner
+            .base_pipeline_handle(unsafe { *base_pipeline_handle.handle() });
+        self
     }
 }
 

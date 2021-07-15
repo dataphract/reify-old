@@ -706,6 +706,29 @@ impl Device {
     ) -> Display {
         unsafe { Display::create(self, surface, phys_window_extent) }
     }
+
+    pub unsafe fn create_pipeline(&self, vert_spv: &[u32], frag_spv: &[u32]) -> () {
+        let device_read = self.inner.read();
+
+        let vert_module = unsafe {
+            device_read.raw.create_shader_module(
+                &vk::ShaderModuleCreateInfoBuilder::new()
+                    .flags(vk::ShaderModuleCreateFlags::empty())
+                    .code(vert_spv),
+            )
+        }
+        .expect("failed to create vertex shader module");
+
+        let frag_module = unsafe {
+            device_read.raw.create_shader_module(
+                &vk::ShaderModuleCreateInfoBuilder::new()
+                    .flags(vk::ShaderModuleCreateFlags::empty())
+                    .code(frag_spv),
+            )
+        }
+        .expect("failed to create fragment shader module");
+        todo!();
+    }
 }
 
 struct QueueInner {
