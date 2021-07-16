@@ -707,7 +707,44 @@ impl Device {
         unsafe { Display::create(self, surface, phys_window_extent) }
     }
 
-    pub unsafe fn create_pipeline(&self, vert_spv: &[u32], frag_spv: &[u32]) -> () {
+    unsafe fn create_render_pass(&self, target: &Display) -> vks::RenderPass {
+        let color_attachment = vk::AttachmentDescriptionBuilder::new()
+            .format(target.info().surface_format.format)
+            .samples(vk::SampleCountFlagBits::_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
+        let attachment_reference = vk::AttachmentReferenceBuilder::new()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+        let color_attachments = &[attachment_reference];
+        let subpass = vk::SubpassDescriptionBuilder::new()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(color_attachments);
+
+        let attachments = &[color_attachment];
+        let subpasses = &[subpass];
+        let render_pass_info = vk::RenderPassCreateInfoBuilder::new()
+            .attachments(attachments)
+            .subpasses(subpasses);
+
+        let render_pass = unsafe { self.inner.read().raw.create_render_pass(&render_pass_info) }
+            .expect("failed to create render pass");
+
+        render_pass
+    }
+
+    pub unsafe fn create_pipeline(
+        &self,
+        vert_spv: &[u32],
+        frag_spv: &[u32],
+        target: &Display,
+    ) -> Pipeline {
         let device_read = self.inner.read();
 
         let vert_module = unsafe {
@@ -727,7 +764,122 @@ impl Device {
             )
         }
         .expect("failed to create fragment shader module");
-        todo!();
+
+        let vert_stage = vks::PipelineShaderStageCreateInfoBuilder::new()
+            .stage(vk::ShaderStageFlagBits::VERTEX)
+            .name(&CStr::from_bytes_with_nul(b"main\0").unwrap())
+            .module(&vert_module);
+
+        let frag_stage = vks::PipelineShaderStageCreateInfoBuilder::new()
+            .stage(vk::ShaderStageFlagBits::FRAGMENT)
+            .name(&CStr::from_bytes_with_nul(b"main\0").unwrap())
+            .module(&frag_module);
+
+        let vertex_input = vk::PipelineVertexInputStateCreateInfoBuilder::new()
+            .vertex_binding_descriptions(&[])
+            .vertex_attribute_descriptions(&[]);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfoBuilder::new()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+
+        let viewport = vk::ViewportBuilder::new()
+            .x(0.0)
+            .y(0.0)
+            .width(target.info().image_extent.width as f32)
+            .height(target.info().image_extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+
+        let scissor = vk::Rect2DBuilder::new()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(target.info().image_extent);
+
+        let viewports = &[viewport];
+        let scissors = &[scissor];
+        let viewport_state = vk::PipelineViewportStateCreateInfoBuilder::new()
+            .viewports(viewports)
+            .scissors(scissors);
+
+        let rasterization_state = vk::PipelineRasterizationStateCreateInfoBuilder::new()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .depth_bias_enable(false);
+
+        let multisample_state = vk::PipelineMultisampleStateCreateInfoBuilder::new()
+            .sample_shading_enable(false)
+            .rasterization_samples(vk::SampleCountFlagBits::_1)
+            .min_sample_shading(1.0)
+            .sample_mask(&[])
+            .alpha_to_coverage_enable(false)
+            .alpha_to_one_enable(false);
+
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentStateBuilder::new()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .blend_enable(false);
+
+        let attachments = &[color_blend_attachment];
+        let color_blend = vk::PipelineColorBlendStateCreateInfoBuilder::new()
+            .attachments(attachments)
+            .logic_op_enable(false);
+
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfoBuilder::new()
+            .set_layouts(&[])
+            .push_constant_ranges(&[]);
+
+        let pipeline_layout = unsafe {
+            self.inner
+                .read()
+                .raw
+                .create_pipeline_layout(&pipeline_layout_info)
+        }
+        .expect("failed to create pipeline layout");
+
+        let render_pass = unsafe { self.create_render_pass(target) };
+
+        let pipeline = unsafe {
+            // Safety: copied handles do not outlive the block.
+            let stages = &[vert_stage.into_inner(), frag_stage.into_inner()];
+
+            let pipeline_info = vks::GraphicsPipelineCreateInfoBuilder::new()
+                .stages(stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization_state)
+                .multisample_state(&multisample_state)
+                .color_blend_state(&color_blend)
+                .layout(&pipeline_layout)
+                .render_pass(&render_pass);
+
+            // Safety: copied handles do not outlive the block.
+            let pipeline_infos = &[pipeline_info.into_inner()];
+            device_read
+                .raw
+                .create_graphics_pipelines(pipeline_infos)
+                .expect("failed to create pipeline")
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+
+        Pipeline {
+            inner: Arc::new(RwLock::new(PipelineInner {
+                pipeline: Some(pipeline),
+                layout: Some(pipeline_layout),
+                pass: Some(render_pass),
+                device: self.clone(),
+            })),
+        }
     }
 }
 
@@ -812,4 +964,39 @@ impl Drop for SwapchainInner {
 #[derive(Clone)]
 pub struct Swapchain {
     inner: Arc<RwLock<SwapchainInner>>,
+}
+
+pub struct PipelineInner {
+    pipeline: Option<vks::Pipeline>,
+    layout: Option<vks::PipelineLayout>,
+    pass: Option<vks::RenderPass>,
+    device: Device,
+}
+
+impl Drop for PipelineInner {
+    fn drop(&mut self) {
+        let device_read = self.device.inner.read();
+
+        if let Some(pipeline) = self.pipeline.take() {
+            unsafe {
+                device_read.raw.destroy_pipeline(pipeline);
+            }
+        }
+
+        if let Some(layout) = self.layout.take() {
+            unsafe {
+                device_read.raw.destroy_pipeline_layout(layout);
+            }
+        }
+
+        if let Some(pass) = self.pass.take() {
+            unsafe {
+                device_read.raw.destroy_render_pass(pass);
+            }
+        }
+    }
+}
+
+pub struct Pipeline {
+    inner: Arc<RwLock<PipelineInner>>,
 }

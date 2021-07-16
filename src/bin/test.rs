@@ -49,6 +49,9 @@ pub fn main() {
         .compile_into_spirv(frag_glsl, ShaderKind::Fragment, "frag.glsl", "main", None)
         .unwrap();
 
+    let pipeline =
+        unsafe { device.create_pipeline(vert_spv.as_binary(), frag_spv.as_binary(), &display) };
+
     event_loop.run(move |event, _target, flow| match event {
         winit::event::Event::WindowEvent {
             window_id: _,

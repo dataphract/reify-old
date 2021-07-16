@@ -9,7 +9,7 @@
 
 use erupt::{vk, DeviceLoader, EntryLoader, InstanceLoader, LoaderError};
 
-use std::lazy::SyncOnceCell;
+use std::{ffi::CStr, lazy::SyncOnceCell};
 
 static ENTRY: SyncOnceCell<EntryLoader> = SyncOnceCell::new();
 
@@ -121,7 +121,15 @@ macro_rules! define_delegated_builder {
                 }
             }
 
-            pub fn into_inner(self) -> vk::$typename<'a> {
+            /// Returns the underlying `erupt` builder.
+            ///
+            /// # Safety
+            ///
+            /// This discards lifetime information associated with `VkObject`
+            /// handles that have been passed into the builder. Callers must
+            /// ensure that any handles referenced by this builder outlive the
+            /// value returned from this method.
+            pub unsafe fn into_inner(self) -> vk::$typename<'a> {
                 self.inner
             }
 
@@ -514,13 +522,103 @@ impl Device {
         }
     }
 
+    /// Creates a new render pass object.
+    ///
+    /// # Safety
+    ///
+    /// - TODO: destroy before destroying parent
+    pub unsafe fn create_render_pass(
+        &self,
+        create_info: &vk::RenderPassCreateInfoBuilder<'_>,
+    ) -> VkResult<RenderPass> {
+        unsafe {
+            self.loader
+                .create_render_pass(create_info, None)
+                .result()
+                .map(|rp| RenderPass::new(rp))
+        }
+    }
+
+    /// Destroys a render pass object.
+    ///
+    /// # Safety
+    ///
+    /// - `render_pass` must be a handle to a render pass object associated with
+    ///   this device.
+    pub unsafe fn destroy_render_pass(&self, mut render_pass: RenderPass) {
+        unsafe {
+            self.loader
+                .destroy_render_pass(Some(*render_pass.handle_mut()), None);
+        }
+    }
+
+    /// Creates a new pipeline layout object.
+    ///
+    /// # Safety
+    ///
+    /// - TODO: destroy before destroying parent
+    pub unsafe fn create_pipeline_layout(
+        &self,
+        create_info: &vk::PipelineLayoutCreateInfoBuilder<'_>,
+    ) -> VkResult<PipelineLayout> {
+        unsafe {
+            self.loader
+                .create_pipeline_layout(create_info, None)
+                .result()
+                .map(|pl| PipelineLayout::new(pl))
+        }
+    }
+
+    /// Destroys a pipeline layout object.
+    ///
+    /// # Safety
+    ///
+    /// - `pipeline_layout` must be a handle to a pipeline layout object
+    ///   associated with this instance.
+    pub unsafe fn destroy_pipeline_layout(&self, mut pipeline_layout: PipelineLayout) {
+        unsafe {
+            self.loader
+                .destroy_pipeline_layout(Some(*pipeline_layout.handle_mut()), None)
+        }
+    }
+
+    /// Creates graphics pipelines.
+    ///
+    /// # Safety
+    ///
+    /// - TODO: lots of handles
+    pub unsafe fn create_graphics_pipelines(
+        &self,
+        create_infos: &[vk::GraphicsPipelineCreateInfoBuilder<'_>],
+    ) -> VkResult<Vec<Pipeline>> {
+        unsafe {
+            Ok(self
+                .loader
+                .create_graphics_pipelines(None, create_infos, None)
+                .result()?
+                .into_iter()
+                .map(|p| Pipeline::new(p))
+                .collect())
+        }
+    }
+
+    /// Destroys a pipeline object.
+    ///
+    /// # Safety
+    ///
+    /// - TODO: destroy before parent device and depended handles
+    pub unsafe fn destroy_pipeline(&self, mut pipeline: Pipeline) {
+        unsafe {
+            self.loader
+                .destroy_pipeline(Some(unsafe { *pipeline.handle_mut() }), None);
+        }
+    }
+
     /// Create a swapchain.
     ///
     /// # Safety
     ///
     /// The caller must uphold the following invariants:
-    /// - `device` must be a handle to a device object associated with this
-    ///   instance.
     /// - `create_info.surface` must be a handle to a surface associated with
     ///   this instance.
     /// - If `create_info.old_swapchain` is `Some(old)`, then `old` must be a
@@ -793,12 +891,6 @@ impl PipelineLayout {
     }
 }
 
-pub struct PipelineLayoutCreateInfo<'a> {
-    flags: vk::PipelineLayoutCreateFlags,
-    set_layouts: &'a [&'a DescriptorSetLayout],
-    push_constant_ranges: &'a [vk::PushConstantRange],
-}
-
 // ============================================================================
 
 define_handle! {
@@ -844,6 +936,25 @@ impl Pipeline {
     /// - TODO: destroy before parent device is destroyed
     pub unsafe fn new(raw: vk::Pipeline) -> Pipeline {
         Pipeline { raw }
+    }
+}
+
+define_delegated_builder! {
+    pub struct PipelineShaderStageCreateInfoBuilder<'a> {
+        inner: vk::PipelineShaderStageCreateInfoBuilder<'a>,
+    }
+
+    impl PipelineShaderStageCreateInfoBuilder {
+        pub fn stage(vk::ShaderStageFlagBits) -> Self;
+        pub fn name(&'a CStr) -> Self;
+        pub fn specialization_info(&'a vk::SpecializationInfo) -> Self;
+    }
+}
+
+impl<'a> PipelineShaderStageCreateInfoBuilder<'a> {
+    pub fn module(mut self, module: &'a ShaderModule) -> PipelineShaderStageCreateInfoBuilder<'a> {
+        self.inner = self.inner.module(unsafe { *module.handle() });
+        self
     }
 }
 

@@ -13,10 +13,10 @@ const SWAPCHAIN_CHOOSES_EXTENT: vk::Extent2D = vk::Extent2D {
 };
 
 pub struct DisplayInfo {
-    min_image_count: u32,
-    surface_format: vk::SurfaceFormatKHR,
-    image_extent: vk::Extent2D,
-    present_mode: vk::PresentModeKHR,
+    pub min_image_count: u32,
+    pub surface_format: vk::SurfaceFormatKHR,
+    pub image_extent: vk::Extent2D,
+    pub present_mode: vk::PresentModeKHR,
 }
 
 pub struct Display {
@@ -214,5 +214,9 @@ impl Display {
             surface: Some(surface),
             device: device.clone(),
         }
+    }
+
+    pub fn info(&self) -> &DisplayInfo {
+        &self.info
     }
 }
