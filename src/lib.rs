@@ -674,6 +674,10 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn read_inner(&self) -> RwLockReadGuard<'_, DeviceInner> {
+        self.inner.read()
+    }
+
     pub fn graphics_queue(&self) -> Queue {
         self.queues.graphics()
     }
@@ -997,6 +1001,18 @@ impl Drop for PipelineInner {
     }
 }
 
+impl PipelineInner {
+    pub fn render_pass(&self) -> &vks::RenderPass {
+        self.pass.as_ref().unwrap()
+    }
+}
+
 pub struct Pipeline {
     inner: Arc<RwLock<PipelineInner>>,
+}
+
+impl Pipeline {
+    pub fn read_inner(&self) -> RwLockReadGuard<'_, PipelineInner> {
+        self.inner.read()
+    }
 }

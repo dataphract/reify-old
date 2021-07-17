@@ -27,7 +27,7 @@ pub fn main() {
 
     let device = phys_device.create_device();
     let phys_size = window.inner_size();
-    let display = unsafe {
+    let mut display = unsafe {
         device.create_display(
             surface,
             vk::Extent2D {
@@ -51,6 +51,8 @@ pub fn main() {
 
     let pipeline =
         unsafe { device.create_pipeline(vert_spv.as_binary(), frag_spv.as_binary(), &display) };
+
+    display.rebuild_framebuffers(pipeline.read_inner().render_pass());
 
     event_loop.run(move |event, _target, flow| match event {
         winit::event::Event::WindowEvent {

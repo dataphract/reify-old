@@ -22,6 +22,7 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
+    framebuffers: Vec<vks::Framebuffer>,
     image_views: Vec<vks::ImageView>,
     images: Vec<vks::Image>,
     swapchain: Option<vks::SwapchainKHR>,
@@ -32,6 +33,12 @@ pub struct Display {
 impl Drop for Display {
     fn drop(&mut self) {
         let device_read = self.device.inner.read();
+
+        for framebuffer in self.framebuffers.drain(..) {
+            unsafe {
+                device_read.raw.destroy_framebuffer(framebuffer);
+            }
+        }
 
         for image_view in self.image_views.drain(..) {
             unsafe {
@@ -208,11 +215,40 @@ impl Display {
 
         Display {
             info,
+            framebuffers: Vec::new(),
             image_views,
             images,
             swapchain: Some(swapchain),
             surface: Some(surface),
             device: device.clone(),
+        }
+    }
+
+    pub fn rebuild_framebuffers(&mut self, render_pass: &vks::RenderPass) {
+        self.framebuffers.clear();
+
+        for view in self.image_views.iter() {
+            unsafe {
+                // Safety: raw handle does not outlive the block.
+                let attachments = &[*view.handle()];
+
+                let create_info = vks::FramebufferCreateInfoBuilder::new()
+                    .flags(vk::FramebufferCreateFlags::empty())
+                    .render_pass(render_pass)
+                    .attachments(attachments)
+                    .width(self.info.image_extent.width)
+                    .height(self.info.image_extent.height)
+                    .layers(1);
+
+                let framebuffer = self
+                    .device
+                    .read_inner()
+                    .raw
+                    .create_framebuffer(&create_info)
+                    .expect("failed to create framebuffer");
+
+                self.framebuffers.push(framebuffer);
+            }
         }
     }
 

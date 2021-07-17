@@ -48,8 +48,8 @@ pub unsafe trait VkObject {
     /// - The raw handle must not be used as a parameter in any Vulkan API call
     ///   which specifies an external synchronization requirement on that
     ///   parameter.
-    /// - No copy of the returned raw handle may be used in any Vulkan API call
-    ///   once the borrow expires.
+    /// - If the raw handle is copied, it is the caller's responsibility to
+    ///   uphold Vulkan's external synchronization rules.
     unsafe fn handle(&self) -> &Self::Handle;
 
     /// Returns a mutable reference to the underlying Vulkan object.
@@ -57,8 +57,8 @@ pub unsafe trait VkObject {
     /// # Safety
     ///
     /// The caller must uphold the following invariants:
-    /// - No copy of the returned raw handle may be used in any Vulkan API call
-    ///   once the mutable borrow expires.
+    /// - If the raw handle is copied, it is the caller's responsibility to
+    ///   uphold Vulkan's external synchronization rules.
     unsafe fn handle_mut(&mut self) -> &mut Self::Handle;
 }
 
@@ -493,6 +493,39 @@ impl Device {
         }
     }
 
+    /// Creates a framebuffer from an existing image.
+    ///
+    /// # Safety
+    ///
+    /// // TODO
+    pub unsafe fn create_framebuffer(
+        &self,
+        create_info: &FramebufferCreateInfoBuilder<'_>,
+    ) -> VkResult<Framebuffer> {
+        unsafe {
+            self.loader
+                .create_framebuffer(&create_info.inner, None)
+                .result()
+                .map(|v| Framebuffer::new(v))
+        }
+    }
+
+    /// Destroys a framebuffer object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - All submitted commands that refer to `framebuffer` must have completed
+    ///   execution.
+    /// - `framebuffer` must be a handle to an framebuffer object associated with
+    ///   this device.
+    pub unsafe fn destroy_framebuffer(&self, mut framebuffer: Framebuffer) {
+        unsafe {
+            self.loader
+                .destroy_framebuffer(Some(*framebuffer.handle_mut()), None)
+        }
+    }
+
     /// Creates a new shader module object.
     ///
     /// # Safety
@@ -792,6 +825,50 @@ define_delegated_builder! {
 impl<'a> ImageViewCreateInfoBuilder<'a> {
     pub fn image(mut self, image: &'a Image) -> Self {
         self.inner = self.inner.image(unsafe { *image.handle() });
+        self
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan framebuffer object.
+    pub struct Framebuffer(vk::Framebuffer);
+}
+
+impl Framebuffer {
+    /// Constructs a new `Framebuffer` which owns the framebuffer associated
+    /// with the raw handle `raw`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `raw` must not be used as a parameter to any Vulkan API call after
+    ///   this constructor is called.
+    /// - `raw` must not be used to create another `Framebuffer` object.
+    /// - TODO: destroy before parent device is destroyed
+    pub unsafe fn new(raw: vk::Framebuffer) -> Framebuffer {
+        Framebuffer { raw }
+    }
+}
+
+define_delegated_builder! {
+    pub struct FramebufferCreateInfoBuilder<'a> {
+        inner: vk::FramebufferCreateInfoBuilder<'a>,
+    }
+
+    impl FramebufferCreateInfoBuilder {
+        pub fn flags(vk::FramebufferCreateFlags) -> Self;
+        pub fn attachments(&'a [vk::ImageView]) -> Self;
+        pub fn width(u32) -> Self;
+        pub fn height(u32) -> Self;
+        pub fn layers(u32) -> Self;
+    }
+}
+
+impl<'a> FramebufferCreateInfoBuilder<'a> {
+    pub fn render_pass(mut self, render_pass: &'a RenderPass) -> Self {
+        self.inner = self.inner.render_pass(unsafe { *render_pass.handle() });
         self
     }
 }
