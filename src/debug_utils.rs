@@ -16,16 +16,24 @@ where
     let bytes = cstr.as_ref().to_bytes();
 
     'format: while start < bytes.len() {
-        match std::str::from_utf8(&bytes[start..]) {
+        let unvalidated = &bytes[start..];
+
+        match std::str::from_utf8(unvalidated) {
             Ok(s) => {
                 f.write_str(s)?;
                 start += s.len();
             }
+
             Err(e) => {
+                // Safety: validated up to `e.valid_up_to()`.
+                let valid =
+                    unsafe { std::str::from_utf8_unchecked(&unvalidated[..e.valid_up_to()]) };
+
+                f.write_str(valid);
                 f.write_char(char::REPLACEMENT_CHARACTER)?;
                 match e.error_len() {
-                    // Skip the unrecognized sequence.
-                    Some(l) => start += l,
+                    // Skip the validated substring and the unrecognized sequence.
+                    Some(l) => start += valid.len() + l,
 
                     // Unexpected end of input.
                     None => break 'format,
@@ -252,6 +260,31 @@ impl DebugMessenger {
         DebugMessenger {
             instance,
             messenger: Some(messenger),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_cstr() {
+        // �
+        let cases = &[
+            (b"A valid C string\0".to_vec(), "A valid C string"),
+            (b"Unexpected EOF: \xE0\0".to_vec(), "Unexpected EOF: �"),
+            (
+                b"Incomplete sequence: \xFA.\0".to_vec(),
+                "Incomplete sequence: �.",
+            ),
+        ];
+
+        let mut actual = String::new();
+        for (input, expected) in cases {
+            actual.clear();
+            format_cstr(&mut actual, CStr::from_bytes_with_nul(input).unwrap()).unwrap();
+            assert_eq!(expected, &actual);
         }
     }
 }
