@@ -22,6 +22,7 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
+    command_buffers: Vec<vks::CommandBuffer>,
     framebuffers: Vec<vks::Framebuffer>,
     image_views: Vec<vks::ImageView>,
     images: Vec<vks::Image>,
@@ -53,7 +54,7 @@ impl Drop for Display {
 
         if let Some(swapchain) = self.swapchain.take() {
             unsafe {
-                device_read.raw.destroy_swapchain(swapchain);
+                device_read.raw.destroy_swapchain_khr(swapchain);
             }
         }
 
@@ -206,6 +207,19 @@ impl Display {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
+        let graphics_command_pool = device.graphics_command_pool();
+
+        let mut pool_mut = graphics_command_pool
+            .get_mut()
+            .expect("failed to acquire command pool");
+        let allocate_info = vks::CommandBufferAllocateInfoBuilder::new()
+            .command_pool(&mut *pool_mut)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(image_views.len() as u32);
+
+        let command_buffers = unsafe { device_read.raw.allocate_command_buffers(&allocate_info) }
+            .expect("failed to allocate command buffers");
+
         let info = DisplayInfo {
             min_image_count,
             surface_format,
@@ -215,6 +229,7 @@ impl Display {
 
         Display {
             info,
+            command_buffers,
             framebuffers: Vec::new(),
             image_views,
             images,

@@ -9,7 +9,7 @@
 
 use erupt::{vk, DeviceLoader, EntryLoader, InstanceLoader, LoaderError};
 
-use std::{ffi::CStr, lazy::SyncOnceCell};
+use std::{convert::TryInto, ffi::CStr, lazy::SyncOnceCell, time::Duration};
 
 static ENTRY: SyncOnceCell<EntryLoader> = SyncOnceCell::new();
 
@@ -49,7 +49,8 @@ pub unsafe trait VkObject {
     ///   which specifies an external synchronization requirement on that
     ///   parameter.
     /// - If the raw handle is copied, it is the caller's responsibility to
-    ///   uphold Vulkan's external synchronization rules.
+    ///   uphold Vulkan's external synchronization rules until the copy is
+    ///   dropped.
     unsafe fn handle(&self) -> &Self::Handle;
 
     /// Returns a mutable reference to the underlying Vulkan object.
@@ -58,7 +59,8 @@ pub unsafe trait VkObject {
     ///
     /// The caller must uphold the following invariants:
     /// - If the raw handle is copied, it is the caller's responsibility to
-    ///   uphold Vulkan's external synchronization rules.
+    ///   uphold Vulkan's external synchronization rules until the copy is
+    ///   dropped.
     unsafe fn handle_mut(&mut self) -> &mut Self::Handle;
 }
 
@@ -82,6 +84,12 @@ macro_rules! define_handle {
             #[inline(always)]
             unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
                 &mut self.raw
+            }
+        }
+
+        impl $defty {
+            unsafe fn new(raw: $raw) -> $defty {
+                $defty { raw }
             }
         }
     };
@@ -392,6 +400,30 @@ impl Instance {
         }
     }
 
+    pub unsafe fn create_xcb_surface_khr(
+        &self,
+        create_info: &vk::XcbSurfaceCreateInfoKHR,
+    ) -> VkResult<SurfaceKHR> {
+        unsafe {
+            self.loader
+                .create_xcb_surface_khr(create_info, None)
+                .result()
+                .map(|s| SurfaceKHR::new(s))
+        }
+    }
+
+    pub unsafe fn create_xlib_surface_khr(
+        &self,
+        create_info: &vk::XlibSurfaceCreateInfoKHR,
+    ) -> VkResult<SurfaceKHR> {
+        unsafe {
+            self.loader
+                .create_xlib_surface_khr(create_info, None)
+                .result()
+                .map(|s| SurfaceKHR::new(s))
+        }
+    }
+
     pub unsafe fn destroy_surface(&self, mut surface: SurfaceKHR) {
         // Safety:
         // - Access to surface is externally synchronized via ownership.
@@ -407,21 +439,6 @@ impl Instance {
 define_handle! {
     /// An opaque handle to a Vulkan physical device object.
     pub struct PhysicalDevice(vk::PhysicalDevice);
-}
-
-impl PhysicalDevice {
-    /// Constructs a new `PhysicalDevice` which owns the physical device object
-    /// associated with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `PhysicalDevice` object.
-    pub unsafe fn new(raw: vk::PhysicalDevice) -> PhysicalDevice {
-        PhysicalDevice { raw }
-    }
 }
 
 // ============================================================================
@@ -460,6 +477,36 @@ impl Device {
         }
     }
 
+    // ------------------------------------------------------------------------
+
+    /// Retrieves a queue handle from a device.
+    ///
+    /// # Safety
+    ///
+    /// **This function must not be called multiple times with the same
+    /// inputs.** Doing so violates the ownership semantics of the `Queue`
+    /// handle by producing multiple values with the same underlying handle.
+    /// It is therefore recommended to call `get_device_queue` once for every
+    /// queue immediately upon device construction, and not again after that.
+    ///
+    /// Additionally, the caller must uphold the following invariants:
+    /// - `queue_family_index` must be one of the queue family indices specified
+    ///   when the device was created.
+    /// - `queue_index` must be less than the number of queues created for the
+    ///   specified queue family when the device was created.
+    /// - The `flags` field of the `vk::DeviceCreateInfo` used to create the
+    ///   device must have been zero.
+    pub unsafe fn get_device_queue(&self, queue_family_index: u32, queue_index: u32) -> Queue {
+        unsafe {
+            Queue::new(
+                self.loader
+                    .get_device_queue(queue_family_index, queue_index),
+            )
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
     /// Creates an image view from an existing image.
     ///
     /// # Safety
@@ -492,6 +539,8 @@ impl Device {
                 .destroy_image_view(Some(*image_view.handle_mut()), None)
         }
     }
+
+    // ------------------------------------------------------------------------
 
     /// Creates a framebuffer from an existing image.
     ///
@@ -526,6 +575,8 @@ impl Device {
         }
     }
 
+    // ------------------------------------------------------------------------
+
     /// Creates a new shader module object.
     ///
     /// # Safety
@@ -554,6 +605,8 @@ impl Device {
                 .destroy_shader_module(Some(*module.handle_mut()), None);
         }
     }
+
+    // ------------------------------------------------------------------------
 
     /// Creates a new render pass object.
     ///
@@ -585,6 +638,8 @@ impl Device {
         }
     }
 
+    // ------------------------------------------------------------------------
+
     /// Creates a new pipeline layout object.
     ///
     /// # Safety
@@ -615,6 +670,8 @@ impl Device {
         }
     }
 
+    // ------------------------------------------------------------------------
+
     /// Creates graphics pipelines.
     ///
     /// # Safety
@@ -643,11 +700,143 @@ impl Device {
     pub unsafe fn destroy_pipeline(&self, mut pipeline: Pipeline) {
         unsafe {
             self.loader
-                .destroy_pipeline(Some(unsafe { *pipeline.handle_mut() }), None);
+                .destroy_pipeline(Some(*pipeline.handle_mut()), None);
         }
     }
 
-    /// Create a swapchain.
+    // ------------------------------------------------------------------------
+
+    /// Creates a new command pool object.
+    ///
+    /// # Safety
+    ///
+    /// - TODO: destroy before parent device
+    pub unsafe fn create_command_pool(
+        &self,
+        create_info: &vk::CommandPoolCreateInfo,
+    ) -> VkResult<CommandPool> {
+        unsafe {
+            self.loader
+                .create_command_pool(create_info, None)
+                .result()
+                .map(|c| CommandPool::new(c))
+        }
+    }
+
+    /// Destroys a command pool object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `command_pool` must be a handle to a command pool object associated
+    ///   with this device.
+    /// - No command buffer allocated from this command pool may be in the
+    ///   pending state.
+    pub unsafe fn destroy_command_pool(&self, mut command_pool: CommandPool) {
+        unsafe {
+            self.loader
+                .destroy_command_pool(Some(*command_pool.handle_mut()), None)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    /// Allocates command buffers from an existing command pool.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `allocate_info.command_pool` must be a handle to a command pool object
+    ///   associated with this device.
+    pub unsafe fn allocate_command_buffers(
+        &self,
+        allocate_info: &CommandBufferAllocateInfoBuilder,
+    ) -> VkResult<Vec<CommandBuffer>> {
+        if allocate_info.inner.command_buffer_count == 0 {
+            panic!("allocate_command_buffers: command_buffer_count must not be 0");
+        }
+
+        unsafe {
+            Ok(self
+                .loader
+                .allocate_command_buffers(&allocate_info.inner)
+                .result()?
+                .into_iter()
+                .map(|cb| CommandBuffer::new(cb))
+                .collect())
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    /// Creates a new fence object.
+    ///
+    /// # Safety
+    ///
+    /// // TODO
+    pub unsafe fn create_fence(&self, create_info: &vk::FenceCreateInfo) -> VkResult<Fence> {
+        unsafe {
+            self.loader
+                .create_fence(create_info, None)
+                .result()
+                .map(|f| Fence::new(f))
+        }
+    }
+
+    /// Destroys a fence object.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `fence` must be a handle to a fence object associated with this device.
+    /// - All queue submission commands that refer to `fence` must have
+    ///   completed execution.
+    pub unsafe fn destroy_fence(&self, mut fence: Fence) {
+        unsafe { self.loader.destroy_fence(Some(*fence.handle_mut()), None) }
+    }
+
+    /// Queries the status of a fence.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `fence` must be a handle to a fence object associated with this device.
+    pub unsafe fn get_fence_status(&self, fence: &Fence) -> VkResult<FenceStatus> {
+        unsafe {
+            match self.loader.get_fence_status(*fence.handle()).raw {
+                vk::Result::SUCCESS => Ok(FenceStatus::Signaled),
+                vk::Result::NOT_READY => Ok(FenceStatus::Unsignaled),
+                e => Err(e),
+            }
+        }
+    }
+
+    pub unsafe fn wait_for_fences(
+        &self,
+        fences: &[vk::Fence],
+        wait_all: bool,
+        timeout: Duration,
+    ) -> VkResult<FenceWaitStatus> {
+        let timeout_ns: u64 = timeout
+            .as_nanos()
+            .try_into()
+            .expect("wait_for_fences: timeout overflowed u64");
+        unsafe {
+            match self
+                .loader
+                .wait_for_fences(fences, wait_all, timeout_ns)
+                .raw
+            {
+                vk::Result::SUCCESS => Ok(FenceWaitStatus::Signaled),
+                vk::Result::TIMEOUT => Ok(FenceWaitStatus::TimedOut),
+                e => Err(e),
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    /// Creates a swapchain.
     ///
     /// # Safety
     ///
@@ -703,7 +892,7 @@ impl Device {
     ///
     /// The caller must uphold the following invariants:
     /// - `swapchain` must be a swapchain object associated with this instance.
-    pub unsafe fn destroy_swapchain(&self, mut swapchain: SwapchainKHR) {
+    pub unsafe fn destroy_swapchain_khr(&self, mut swapchain: SwapchainKHR) {
         unsafe {
             // Safety:
             // - `swapchain` is externally synchronized, as it is received by value.
@@ -743,22 +932,6 @@ define_handle! {
     pub struct Queue(vk::Queue);
 }
 
-impl Queue {
-    /// Constructs a new `Queue` which owns the queue associated with the raw
-    /// handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Queue` object.
-    /// - TODO: must not be used after parent `Device` is destroyed
-    pub unsafe fn new(raw: vk::Queue) -> Queue {
-        Queue { raw }
-    }
-}
-
 // ============================================================================
 
 define_handle! {
@@ -766,46 +939,11 @@ define_handle! {
     pub struct Image(vk::Image);
 }
 
-impl Image {
-    /// Constructs a new `Image` which owns the image associated with the raw
-    /// handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Image` object.
-    /// - If the image was created by a device, it must be destroyed by a call
-    ///   to `Device::destroy_image`.
-    /// - If the image was obtained from a swapchain with `Device::get_swapchain_images_khr`,
-    ///   it must not be used after the associated swapchain has been destroyed.
-    pub unsafe fn new(raw: vk::Image) -> Image {
-        Image { raw }
-    }
-}
-
 // ============================================================================
 
 define_handle! {
     /// An opaque handle to a Vulkan image view object.
     pub struct ImageView(vk::ImageView);
-}
-
-impl ImageView {
-    /// Constructs a new `Image` which owns the image view associated with the
-    /// raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `ImageView` object.
-    /// // TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::ImageView) -> ImageView {
-        ImageView { raw }
-    }
 }
 
 define_delegated_builder! {
@@ -836,22 +974,6 @@ define_handle! {
     pub struct Framebuffer(vk::Framebuffer);
 }
 
-impl Framebuffer {
-    /// Constructs a new `Framebuffer` which owns the framebuffer associated
-    /// with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Framebuffer` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::Framebuffer) -> Framebuffer {
-        Framebuffer { raw }
-    }
-}
-
 define_delegated_builder! {
     pub struct FramebufferCreateInfoBuilder<'a> {
         inner: vk::FramebufferCreateInfoBuilder<'a>,
@@ -880,44 +1002,11 @@ define_handle! {
     pub struct ShaderModule(vk::ShaderModule);
 }
 
-impl ShaderModule {
-    /// Constructs a new `ShaderModule` which owns the shader module associated
-    /// with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `ShaderModule` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::ShaderModule) -> ShaderModule {
-        ShaderModule { raw }
-    }
-}
-
 // ============================================================================
 
 define_handle! {
     /// An opaque handle to a sampler object.
     pub struct Sampler(vk::Sampler);
-}
-
-impl Sampler {
-    /// Constructs a new `Sampler` which owns the sampler object associated with
-    /// the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    ///
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Sampler` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::Sampler) -> Sampler {
-        Sampler { raw }
-    }
 }
 
 // ============================================================================
@@ -927,45 +1016,11 @@ define_handle! {
     pub struct DescriptorSetLayout(vk::DescriptorSetLayout);
 }
 
-impl DescriptorSetLayout {
-    /// Constructs a new `DescriptorSetLayout` which owns the descriptor set
-    /// layout object associated with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    ///
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `DescriptorSetLayout` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::DescriptorSetLayout) -> DescriptorSetLayout {
-        DescriptorSetLayout { raw }
-    }
-}
-
 // ============================================================================
 
 define_handle! {
     /// An opaque handle to a pipeline layout object.
     pub struct PipelineLayout(vk::PipelineLayout);
-}
-
-impl PipelineLayout {
-    /// Constructs a new `PipelineLayout` which owns the pipeline layout object
-    /// associated with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    ///
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `PipelineLayout` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::PipelineLayout) -> PipelineLayout {
-        PipelineLayout { raw }
-    }
 }
 
 // ============================================================================
@@ -975,45 +1030,11 @@ define_handle! {
     pub struct RenderPass(vk::RenderPass);
 }
 
-impl RenderPass {
-    /// Constructs a new `RenderPass` which owns the render pass object
-    /// associated with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    ///
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `RenderPass` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::RenderPass) -> RenderPass {
-        RenderPass { raw }
-    }
-}
-
 // ============================================================================
 
 define_handle! {
     /// An opaque handle to a Vulkan pipeline object.
     pub struct Pipeline(vk::Pipeline);
-}
-
-impl Pipeline {
-    /// Constructs a new `Pipeline` which owns the pipeline object associated
-    /// with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    ///
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Pipeline` object.
-    /// - TODO: destroy before parent device is destroyed
-    pub unsafe fn new(raw: vk::Pipeline) -> Pipeline {
-        Pipeline { raw }
-    }
 }
 
 define_delegated_builder! {
@@ -1079,24 +1100,74 @@ impl<'a> GraphicsPipelineCreateInfoBuilder<'a> {
 // ============================================================================
 
 define_handle! {
-    /// An opaque handle to a Vulkan surface object.
-    pub struct SurfaceKHR(vk::SurfaceKHR);
+    /// An opaque handle to a Vulkan command pool object.
+    pub struct CommandPool(vk::CommandPool);
 }
 
-impl SurfaceKHR {
-    /// Constructs a new `Surface` which owns the surface associated with the
-    /// raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Surface` object.
-    /// - TODO: must be destroyed before instance is destroyed
-    pub unsafe fn new(raw: vk::SurfaceKHR) -> SurfaceKHR {
-        SurfaceKHR { raw }
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan command buffer object.
+    pub struct CommandBuffer(vk::CommandBuffer);
+}
+
+define_delegated_builder! {
+    pub struct CommandBufferAllocateInfoBuilder<'a> {
+        inner: vk::CommandBufferAllocateInfoBuilder<'a>,
     }
+
+    impl CommandBufferAllocateInfoBuilder {
+        pub fn level(vk::CommandBufferLevel) -> Self;
+        pub fn command_buffer_count(u32) -> Self;
+    }
+}
+
+impl<'a> CommandBufferAllocateInfoBuilder<'a> {
+    pub fn command_pool(mut self, command_pool: &'a mut CommandPool) -> Self {
+        // Safety: command_pool is externally synchronized via mutable reference
+        self.inner = self
+            .inner
+            .command_pool(unsafe { *command_pool.handle_mut() });
+        self
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a fence object.
+    pub struct Fence(vk::Fence);
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FenceStatus {
+    Unsignaled,
+    Signaled,
+}
+
+impl FenceStatus {
+    pub fn is_signaled(&self) -> bool {
+        *self == Self::Signaled
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FenceWaitStatus {
+    TimedOut,
+    Signaled,
+}
+
+impl FenceWaitStatus {
+    pub fn is_signaled(&self) -> bool {
+        *self == Self::Signaled
+    }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan surface object.
+    pub struct SurfaceKHR(vk::SurfaceKHR);
 }
 
 // ============================================================================
@@ -1104,21 +1175,6 @@ impl SurfaceKHR {
 define_handle! {
     /// An opaque handle to a Vulkan swapchain object.
     pub struct SwapchainKHR(vk::SwapchainKHR);
-}
-
-impl SwapchainKHR {
-    /// Constructs a new `Swapchain` which owns the swapchain associated with
-    /// the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `Swapchain` object.
-    pub unsafe fn new(raw: vk::SwapchainKHR) -> SwapchainKHR {
-        SwapchainKHR { raw }
-    }
 }
 
 pub struct SwapchainCreateInfo<'surf, 'queues> {
@@ -1143,22 +1199,6 @@ pub struct SwapchainCreateInfo<'surf, 'queues> {
 
 define_handle! {
     pub struct DebugUtilsMessengerEXT(vk::DebugUtilsMessengerEXT);
-}
-
-impl DebugUtilsMessengerEXT {
-    /// Constructs a new `DebugMessenger` which owns the debug utils messenger
-    /// associated with the raw handle `raw`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must uphold the following invariants:
-    /// - `raw` must not be used as a parameter to any Vulkan API call after
-    ///   this constructor is called.
-    /// - `raw` must not be used to create another `DebugMessenger` object.
-    /// - TODO: must be destroyed before instance is destroyed
-    pub unsafe fn new(raw: vk::DebugUtilsMessengerEXT) -> DebugUtilsMessengerEXT {
-        DebugUtilsMessengerEXT { raw }
-    }
 }
 
 // ============================================================================

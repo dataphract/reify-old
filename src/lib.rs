@@ -6,6 +6,7 @@ mod display;
 pub mod vks;
 
 use std::{
+    cell::{Ref, RefCell, RefMut},
     ffi::{CStr, CString},
     sync::Arc,
 };
@@ -14,6 +15,7 @@ use arrayvec::ArrayVec;
 use erupt::vk;
 use parking_lot::{RwLock, RwLockReadGuard};
 use raw_window_handle::RawWindowHandle;
+use thread_local::ThreadLocal;
 use vks::VkObject;
 
 pub use debug_utils::DebugMessenger;
@@ -245,7 +247,7 @@ impl Instance {
     pub fn create_surface(&self, window: RawWindowHandle) -> vks::SurfaceKHR {
         let read_lock = self.inner.read();
 
-        let raw_surface = match window {
+        let surface = match window {
             RawWindowHandle::Xlib(xlib) => {
                 let create_info = vk::XlibSurfaceCreateInfoKHRBuilder::new()
                     .flags(vk::XlibSurfaceCreateFlagsKHR::empty())
@@ -255,8 +257,7 @@ impl Instance {
                 unsafe {
                     read_lock
                         .handle
-                        .handle()
-                        .create_xlib_surface_khr(&create_info, None)
+                        .create_xlib_surface_khr(&create_info)
                         .expect("failed to create Xlib window surface")
                 }
             }
@@ -269,8 +270,7 @@ impl Instance {
                 unsafe {
                     read_lock
                         .handle
-                        .handle()
-                        .create_xcb_surface_khr(&create_info, None)
+                        .create_xcb_surface_khr(&create_info)
                         .expect("failed to create XCB window surface")
                 }
             }
@@ -278,9 +278,7 @@ impl Instance {
             _ => panic!("unrecognized window handle"),
         };
 
-        drop(read_lock);
-
-        unsafe { vks::SurfaceKHR::new(raw_surface) }
+        surface
     }
 
     #[cfg(not(any(
@@ -541,23 +539,18 @@ impl PhysicalDevice {
             instance: self.inner.instance.clone(),
         }));
 
+        let inner_cloned = inner.clone();
         let inner_read = inner.read();
 
         let mut family_ids = ArrayVec::new();
         let mut queues = ArrayVec::new();
+        let mut cmd_pools = ArrayVec::new();
         for (info, id) in unique_queue_families
             .infos()
             .into_iter()
             .zip(unique_queue_families.family_ids.iter())
         {
-            let raw_queue = unsafe {
-                vks::Queue::new(
-                    inner_read
-                        .raw
-                        .handle()
-                        .get_device_queue(info.queue_family_index, 0),
-                )
-            };
+            let raw_queue = unsafe { inner_read.raw.get_device_queue(info.queue_family_index, 0) };
 
             let queue = Queue {
                 inner: Arc::new(RwLock::new(QueueInner {
@@ -568,17 +561,25 @@ impl PhysicalDevice {
 
             family_ids.push(*id);
             queues.push(queue);
+
+            // TODO: num threads
+            cmd_pools.push(Arc::new(ThreadLocalCommandPool::new(
+                inner_cloned.clone(),
+                *id,
+                16,
+            )));
         }
 
-        drop(inner_read);
-
         let queues = DeviceQueues {
+            cmd_pools,
             family_ids,
             queues,
             graphics,
             transfer,
             present,
         };
+
+        drop(inner_read);
 
         Device { inner, queues }
     }
@@ -623,26 +624,98 @@ impl<'a> UniqueQueueFamilies<'a> {
     }
 }
 
+pub struct ThreadLocalCommandPool {
+    command_pool: ThreadLocal<Option<RefCell<vks::CommandPool>>>,
+    queue_family_id: u32,
+    device: Arc<RwLock<DeviceInner>>,
+}
+
+impl Drop for ThreadLocalCommandPool {
+    fn drop(&mut self) {
+        let device_read = self.device.read();
+
+        for pool in self.command_pool.iter_mut() {
+            if let Some(p) = pool.take() {
+                unsafe {
+                    device_read.raw.destroy_command_pool(p.into_inner());
+                }
+            }
+        }
+    }
+}
+
+impl ThreadLocalCommandPool {
+    pub fn new(
+        device: Arc<RwLock<DeviceInner>>,
+        queue_family_id: u32,
+        capacity: usize,
+    ) -> ThreadLocalCommandPool {
+        ThreadLocalCommandPool {
+            command_pool: ThreadLocal::with_capacity(capacity),
+            queue_family_id,
+            device,
+        }
+    }
+
+    fn init(&self) -> vks::VkResult<vks::CommandPool> {
+        let command_pool_info = vk::CommandPoolCreateInfoBuilder::new()
+            .queue_family_index(self.queue_family_id)
+            .flags(vk::CommandPoolCreateFlags::empty());
+
+        let command_pool = unsafe {
+            self.device
+                .read()
+                .raw
+                .create_command_pool(&command_pool_info)?
+        };
+
+        Ok(command_pool)
+    }
+
+    pub fn get(&self) -> vks::VkResult<Ref<vks::CommandPool>> {
+        Ok(self
+            .command_pool
+            .get_or_try(|| self.init().map(|p| Some(RefCell::new(p))))?
+            .as_ref()
+            .unwrap()
+            .borrow())
+    }
+
+    pub fn get_mut(&self) -> vks::VkResult<RefMut<vks::CommandPool>> {
+        Ok(self
+            .command_pool
+            .get_or_try(|| self.init().map(|p| Some(RefCell::new(p))))?
+            .as_ref()
+            .unwrap()
+            .borrow_mut())
+    }
+}
+
 #[derive(Clone)]
 struct DeviceQueues {
     graphics: u8,
     transfer: u8,
     present: u8,
 
+    cmd_pools: ArrayVec<Arc<ThreadLocalCommandPool>, MAX_DEVICE_QUEUES>,
     family_ids: ArrayVec<u32, MAX_DEVICE_QUEUES>,
     queues: ArrayVec<Queue, MAX_DEVICE_QUEUES>,
 }
 
 impl DeviceQueues {
-    pub fn graphics(&self) -> Queue {
+    pub fn graphics_queue(&self) -> Queue {
         self.queues[self.graphics as usize].clone()
+    }
+
+    pub fn graphics_command_pool(&self) -> Arc<ThreadLocalCommandPool> {
+        self.cmd_pools[self.graphics as usize].clone()
     }
 
     pub fn graphics_family_id(&self) -> u32 {
         self.family_ids[self.graphics as usize]
     }
 
-    pub fn transfer(&self) -> Queue {
+    pub fn transfer_queue(&self) -> Queue {
         self.queues[self.transfer as usize].clone()
     }
 
@@ -650,7 +723,7 @@ impl DeviceQueues {
         self.family_ids[self.transfer as usize]
     }
 
-    pub fn present(&self) -> Queue {
+    pub fn present_queue(&self) -> Queue {
         self.queues[self.present as usize].clone()
     }
 
@@ -661,6 +734,9 @@ impl DeviceQueues {
 
 pub struct DeviceInner {
     // NOTE: sensitive drop order.
+    //command_buffer_fence: Option<vks::Fence>,
+    //command_buffer: Option<vks::CommandBuffer>,
+    //command_pool: Option<vks::CommandPool>,
     raw: vks::Device,
     phys_device: PhysicalDevice,
     instance: Instance,
@@ -679,7 +755,11 @@ impl Device {
     }
 
     pub fn graphics_queue(&self) -> Queue {
-        self.queues.graphics()
+        self.queues.graphics_queue()
+    }
+
+    pub fn graphics_command_pool(&self) -> Arc<ThreadLocalCommandPool> {
+        self.queues.graphics_command_pool()
     }
 
     pub fn graphics_family_id(&self) -> u32 {
@@ -687,7 +767,7 @@ impl Device {
     }
 
     pub fn transfer_queue(&self) -> Queue {
-        self.queues.transfer()
+        self.queues.transfer_queue()
     }
 
     pub fn transfer_family_id(&self) -> u32 {
@@ -695,7 +775,7 @@ impl Device {
     }
 
     pub fn present_queue(&self) -> Queue {
-        self.queues.present()
+        self.queues.present_queue()
     }
 
     pub fn present_family_id(&self) -> u32 {
@@ -960,7 +1040,7 @@ impl Drop for SwapchainInner {
         if let Some(swapchain) = self.raw.take() {
             let device_read = self.device.inner.read();
 
-            unsafe { device_read.raw.destroy_swapchain(swapchain) }
+            unsafe { device_read.raw.destroy_swapchain_khr(swapchain) }
         }
     }
 }
