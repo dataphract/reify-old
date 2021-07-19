@@ -1082,6 +1082,10 @@ impl Drop for PipelineInner {
 }
 
 impl PipelineInner {
+    pub fn pipeline(&self) -> &vks::Pipeline {
+        self.pipeline.as_ref().unwrap()
+    }
+
     pub fn render_pass(&self) -> &vks::RenderPass {
         self.pass.as_ref().unwrap()
     }

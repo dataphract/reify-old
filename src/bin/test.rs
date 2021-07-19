@@ -52,7 +52,11 @@ pub fn main() {
     let pipeline =
         unsafe { device.create_pipeline(vert_spv.as_binary(), frag_spv.as_binary(), &display) };
 
-    display.rebuild_framebuffers(pipeline.read_inner().render_pass());
+    {
+        let pipeline_read = pipeline.read_inner();
+        display.rebuild_framebuffers(pipeline.read_inner().render_pass());
+        display.record_command_buffers(pipeline_read.render_pass(), pipeline_read.pipeline());
+    }
 
     event_loop.run(move |event, _target, flow| match event {
         winit::event::Event::WindowEvent {

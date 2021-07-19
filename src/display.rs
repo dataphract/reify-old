@@ -22,6 +22,9 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
+    image_available: Option<vks::Semaphore>,
+    render_complete: Option<vks::Semaphore>,
+
     command_buffers: Vec<vks::CommandBuffer>,
     framebuffers: Vec<vks::Framebuffer>,
     image_views: Vec<vks::ImageView>,
@@ -34,6 +37,14 @@ pub struct Display {
 impl Drop for Display {
     fn drop(&mut self) {
         let device_read = self.device.inner.read();
+
+        if let Some(sem) = self.image_available.take() {
+            unsafe { device_read.raw.destroy_semaphore(sem) };
+        }
+
+        if let Some(sem) = self.render_complete.take() {
+            unsafe { device_read.raw.destroy_semaphore(sem) };
+        }
 
         for framebuffer in self.framebuffers.drain(..) {
             unsafe {
@@ -227,7 +238,15 @@ impl Display {
             present_mode,
         };
 
+        let semaphore_create_info = vk::SemaphoreCreateInfoBuilder::new();
+        let image_available = unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
+            .expect("failed to create image_available semaphore");
+        let render_complete = unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
+            .expect("failed to create render_complete semaphore");
+
         Display {
+            image_available: Some(image_available),
+            render_complete: Some(render_complete),
             info,
             command_buffers,
             framebuffers: Vec::new(),
@@ -263,6 +282,60 @@ impl Display {
                     .expect("failed to create framebuffer");
 
                 self.framebuffers.push(framebuffer);
+            }
+        }
+    }
+
+    pub fn record_command_buffers(
+        &mut self,
+        render_pass: &vks::RenderPass,
+        pipeline: &vks::Pipeline,
+    ) {
+        let device_read = self.device.read_inner();
+
+        for i in 0..self.command_buffers.len() {
+            let cmdbuf = &mut self.command_buffers[i];
+            let framebuffer = &self.framebuffers[i];
+
+            let begin_info = vk::CommandBufferBeginInfoBuilder::new()
+                .flags(vk::CommandBufferUsageFlags::empty());
+
+            unsafe {
+                device_read
+                    .raw
+                    .begin_command_buffer(cmdbuf, &begin_info)
+                    .expect("failed to begin recording command buffer");
+            }
+
+            let clear_values = &[vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            }];
+            let pass_info = vks::RenderPassBeginInfoBuilder::new()
+                .render_pass(render_pass)
+                .framebuffer(framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.info.image_extent,
+                })
+                .clear_values(clear_values);
+
+            unsafe {
+                device_read.raw.cmd_begin_render_pass(
+                    cmdbuf,
+                    &pass_info,
+                    vk::SubpassContents::INLINE,
+                );
+
+                device_read.raw.cmd_bind_pipeline(
+                    cmdbuf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline,
+                );
+
+                device_read.raw.cmd_draw(cmdbuf, 3, 1, 0, 0);
+                device_read.raw.cmd_end_render_pass(cmdbuf);
             }
         }
     }

@@ -767,6 +767,84 @@ impl Device {
         }
     }
 
+    /// Begins recording a command buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `command_buffer` must be a handle to a command buffer object
+    ///   associated with this device.
+    pub unsafe fn begin_command_buffer(
+        &self,
+        command_buffer: &mut CommandBuffer,
+        begin_info: &vk::CommandBufferBeginInfoBuilder<'_>,
+    ) -> VkResult<()> {
+        unsafe {
+            // Safety: command_buffer is externally syncronized via mutable reference.
+            self.loader
+                .begin_command_buffer(*command_buffer.handle_mut(), begin_info)
+                .result()?;
+        }
+
+        Ok(())
+    }
+
+    pub unsafe fn cmd_begin_render_pass(
+        &self,
+        command_buffer: &mut CommandBuffer,
+        begin_info: &RenderPassBeginInfoBuilder<'_>,
+        contents: vk::SubpassContents,
+    ) {
+        unsafe {
+            self.loader.cmd_begin_render_pass(
+                *command_buffer.handle_mut(),
+                &begin_info.inner,
+                contents,
+            );
+        }
+    }
+
+    pub unsafe fn cmd_bind_pipeline(
+        &self,
+        command_buffer: &mut CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        pipeline: &Pipeline,
+    ) {
+        unsafe {
+            self.loader.cmd_bind_pipeline(
+                *command_buffer.handle_mut(),
+                bind_point,
+                *pipeline.handle(),
+            );
+        }
+    }
+
+    pub unsafe fn cmd_draw(
+        &self,
+        command_buffer: &mut CommandBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) {
+        unsafe {
+            self.loader.cmd_draw(
+                *command_buffer.handle_mut(),
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            );
+        }
+    }
+
+    pub unsafe fn cmd_end_render_pass(&self, command_buffer: &mut CommandBuffer) {
+        unsafe {
+            self.loader
+                .cmd_end_render_pass(*command_buffer.handle_mut());
+        }
+    }
+
     // ------------------------------------------------------------------------
 
     /// Creates a new fence object.
@@ -831,6 +909,27 @@ impl Device {
                 vk::Result::TIMEOUT => Ok(FenceWaitStatus::TimedOut),
                 e => Err(e),
             }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub unsafe fn create_semaphore(
+        &self,
+        create_info: &vk::SemaphoreCreateInfoBuilder<'_>,
+    ) -> VkResult<Semaphore> {
+        unsafe {
+            self.loader
+                .create_semaphore(create_info, None)
+                .result()
+                .map(|s| Semaphore::new(s))
+        }
+    }
+
+    pub unsafe fn destroy_semaphore(&self, mut semaphore: Semaphore) {
+        unsafe {
+            self.loader
+                .destroy_semaphore(Some(*semaphore.handle_mut()), None);
         }
     }
 
@@ -1030,6 +1129,29 @@ define_handle! {
     pub struct RenderPass(vk::RenderPass);
 }
 
+define_delegated_builder! {
+    pub struct RenderPassBeginInfoBuilder<'a> {
+        inner: vk::RenderPassBeginInfoBuilder<'a>,
+    }
+
+    impl RenderPassBeginInfoBuilder {
+        pub fn render_area(vk::Rect2D) -> Self;
+        pub fn clear_values(&'a [vk::ClearValue]) -> Self;
+    }
+}
+
+impl<'a> RenderPassBeginInfoBuilder<'a> {
+    pub fn render_pass(mut self, render_pass: &'a RenderPass) -> Self {
+        self.inner = self.inner.render_pass(unsafe { *render_pass.handle() });
+        self
+    }
+
+    pub fn framebuffer(mut self, framebuffer: &'a Framebuffer) -> Self {
+        self.inner = self.inner.framebuffer(unsafe { *framebuffer.handle() });
+        self
+    }
+}
+
 // ============================================================================
 
 define_handle! {
@@ -1161,6 +1283,13 @@ impl FenceWaitStatus {
     pub fn is_signaled(&self) -> bool {
         *self == Self::Signaled
     }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan semaphore object.
+    pub struct Semaphore(vk::Semaphore);
 }
 
 // ============================================================================
