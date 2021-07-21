@@ -25,7 +25,11 @@ pub struct Display {
     image_available: Option<vks::Semaphore>,
     render_complete: Option<vks::Semaphore>,
 
-    command_buffers: Vec<vks::CommandBuffer>,
+    // Only used if graphics and present queues are from different families.
+    present_queue_ownership: Option<vks::Semaphore>,
+
+    graphics_command_buffers: Vec<vks::CommandBuffer>,
+    present_command_buffers: Vec<vks::CommandBuffer>,
     framebuffers: Vec<vks::Framebuffer>,
     image_views: Vec<vks::ImageView>,
     images: Vec<vks::Image>,
@@ -43,6 +47,10 @@ impl Drop for Display {
         }
 
         if let Some(sem) = self.render_complete.take() {
+            unsafe { device_read.raw.destroy_semaphore(sem) };
+        }
+
+        if let Some(sem) = self.present_queue_ownership.take() {
             unsafe { device_read.raw.destroy_semaphore(sem) };
         }
 
@@ -191,6 +199,8 @@ impl Display {
         let images = unsafe { device_read.raw.get_swapchain_images_khr(&swapchain) }
             .expect("failed to get swapchain images");
 
+        log::info!("Retrieved {} images from swapchain.", images.len());
+
         let image_views = images
             .iter()
             .map(|img| unsafe {
@@ -218,18 +228,33 @@ impl Display {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        let graphics_command_pool = device.graphics_command_pool();
+        let graphics_command_buffers = {
+            let graphics_command_pool = device.graphics_command_pool();
+            let mut pool_mut = graphics_command_pool
+                .get_mut()
+                .expect("failed to acquire command pool");
+            let allocate_info = vks::CommandBufferAllocateInfoBuilder::new()
+                .command_pool(&mut *pool_mut)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(image_views.len() as u32);
 
-        let mut pool_mut = graphics_command_pool
-            .get_mut()
-            .expect("failed to acquire command pool");
-        let allocate_info = vks::CommandBufferAllocateInfoBuilder::new()
-            .command_pool(&mut *pool_mut)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(image_views.len() as u32);
+            unsafe { device_read.raw.allocate_command_buffers(&allocate_info) }
+                .expect("failed to allocate command buffers")
+        };
 
-        let command_buffers = unsafe { device_read.raw.allocate_command_buffers(&allocate_info) }
-            .expect("failed to allocate command buffers");
+        let present_command_buffers = {
+            let present_command_pool = device.present_command_pool();
+            let mut pool_mut = present_command_pool
+                .get_mut()
+                .expect("failed to acquire command pool");
+            let allocate_info = vks::CommandBufferAllocateInfoBuilder::new()
+                .command_pool(&mut *pool_mut)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(image_views.len() as u32);
+
+            unsafe { device_read.raw.allocate_command_buffers(&allocate_info) }
+                .expect("failed to allocate command buffers")
+        };
 
         let info = DisplayInfo {
             min_image_count,
@@ -243,12 +268,17 @@ impl Display {
             .expect("failed to create image_available semaphore");
         let render_complete = unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
             .expect("failed to create render_complete semaphore");
+        let present_queue_ownership =
+            unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
+                .expect("failed to create present_queue_ownership semaphore");
 
         Display {
             image_available: Some(image_available),
             render_complete: Some(render_complete),
+            present_queue_ownership: Some(present_queue_ownership),
             info,
-            command_buffers,
+            graphics_command_buffers,
+            present_command_buffers,
             framebuffers: Vec::new(),
             image_views,
             images,
@@ -286,57 +316,317 @@ impl Display {
         }
     }
 
+    pub fn record_graphics_command_buffer(
+        &mut self,
+        render_pass: &vks::RenderPass,
+        pipeline: &vks::Pipeline,
+        index: usize,
+    ) {
+        let device_read = self.device.read_inner();
+        let cmdbuf = &mut self.graphics_command_buffers[index];
+        let framebuffer = &self.framebuffers[index];
+        let graphics_present_differ =
+            self.device.graphics_family_id() != self.device.present_family_id();
+
+        let begin_info =
+            vk::CommandBufferBeginInfoBuilder::new().flags(vk::CommandBufferUsageFlags::empty());
+
+        unsafe {
+            device_read
+                .raw
+                .begin_command_buffer(cmdbuf, &begin_info)
+                .expect("failed to begin recording graphics command buffer");
+        }
+
+        if graphics_present_differ {
+            // The EXTERNAL -> 0 subpass dependency was omitted, so insert a
+            // barrier to perform the layout transition here.
+
+            let subresource_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: vk::REMAINING_MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            };
+
+            let pre_render_barrier = vks::ImageMemoryBarrierBuilder::new()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                // The whole image is being cleared, so it's not necessary
+                // to perform a QFOT here.
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(&self.images[index])
+                .subresource_range(subresource_range);
+
+            unsafe {
+                device_read.raw.cmd_pipeline_barrier(
+                    cmdbuf,
+                    // Wait for any previous color output to complete before
+                    // beginning output, precluding a WAW hazard.
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    // Safety: Produced raw handles do not outlive the block.
+                    &[pre_render_barrier.into_inner()],
+                );
+            }
+        }
+
+        let clear_values = &[vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        let pass_info = vks::RenderPassBeginInfoBuilder::new()
+            .render_pass(render_pass)
+            .framebuffer(framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.info.image_extent,
+            })
+            .clear_values(clear_values);
+
+        unsafe {
+            device_read
+                .raw
+                .cmd_begin_render_pass(cmdbuf, &pass_info, vk::SubpassContents::INLINE);
+
+            device_read
+                .raw
+                .cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+
+            device_read.raw.cmd_draw(cmdbuf, 3, 1, 0, 0);
+            device_read.raw.cmd_end_render_pass(cmdbuf);
+        }
+
+        if graphics_present_differ {
+            // Need to perform a QFOT from the graphics queue to the present
+            // queue. Layout transition can occur simultaneously.
+
+            let subresource_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: vk::REMAINING_MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            };
+
+            let post_render_barrier = vks::ImageMemoryBarrierBuilder::new()
+                // Make all writes to the color attachment available.
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                // Transition to presentation layout.
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                // Release ownership from graphics queue to present queue.
+                .src_queue_family_index(self.device.graphics_family_id())
+                .dst_queue_family_index(self.device.present_family_id())
+                .image(&self.images[index])
+                .subresource_range(subresource_range);
+
+            unsafe {
+                device_read.raw.cmd_pipeline_barrier(
+                    cmdbuf,
+                    // Wait for color output to complete before ending the
+                    // submission.
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    // Safety: Produced raw handles do not outlive the block.
+                    &[post_render_barrier.into_inner()],
+                );
+            }
+        }
+
+        unsafe {
+            device_read
+                .raw
+                .end_command_buffer(cmdbuf)
+                .expect("failed to end recording graphics command buffer");
+        }
+    }
+
     pub fn record_command_buffers(
         &mut self,
         render_pass: &vks::RenderPass,
         pipeline: &vks::Pipeline,
     ) {
+        let graphics_present_differ =
+            self.device.graphics_family_id() != self.device.present_family_id();
+
+        if graphics_present_differ {
+            log::info!("using separate graphics and present queues");
+        } else {
+            log::info!("using shared graphics and present queue");
+        }
+
+        for index in 0..self.images.len() {
+            self.record_graphics_command_buffer(render_pass, pipeline, index);
+            let device_read = self.device.read_inner();
+            if graphics_present_differ {
+                let cmdbuf = &mut self.present_command_buffers[index];
+                let image = &self.images[index];
+
+                let begin_info = vk::CommandBufferBeginInfoBuilder::new()
+                    .flags(vk::CommandBufferUsageFlags::empty());
+
+                unsafe {
+                    device_read
+                        .raw
+                        .begin_command_buffer(cmdbuf, &begin_info)
+                        .expect("failed to begin presentation command buffer");
+                }
+
+                let subresource_range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                };
+
+                unsafe {
+                    let acquire_attachment_barrier = vk::ImageMemoryBarrierBuilder::new()
+                        // No access masks needed: graphics command buffer
+                        // submission signals a semaphore, which defines a
+                        // memory dependency. (§6.4.1 Semaphore Signaling)
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::empty())
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                        .src_queue_family_index(self.device.graphics_family_id())
+                        .dst_queue_family_index(self.device.present_family_id())
+                        .image(*image.handle())
+                        .subresource_range(subresource_range);
+
+                    device_read.raw.cmd_pipeline_barrier(
+                        cmdbuf,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[acquire_attachment_barrier],
+                    );
+
+                    device_read
+                        .raw
+                        .end_command_buffer(cmdbuf)
+                        .expect("failed to end recording present command buffer");
+                }
+            }
+        }
+    }
+
+    pub fn draw(&mut self) {
+        log::trace!("drawing");
         let device_read = self.device.read_inner();
 
-        for i in 0..self.command_buffers.len() {
-            let cmdbuf = &mut self.command_buffers[i];
-            let framebuffer = &self.framebuffers[i];
+        let graphics_present_differ =
+            self.device.graphics_family_id() != self.device.present_family_id();
 
-            let begin_info = vk::CommandBufferBeginInfoBuilder::new()
-                .flags(vk::CommandBufferUsageFlags::empty());
+        let acquired = unsafe {
+            device_read.raw.acquire_next_image_khr(
+                self.swapchain.as_mut().unwrap(),
+                None,
+                Some(self.image_available.as_mut().unwrap()),
+                None,
+            )
+        }
+        .expect("failed to acquire next swapchain image");
 
+        let graphics_queue = self.device.graphics_queue();
+        let mut graphics_queue_write = graphics_queue.write_inner();
+
+        // Submit graphics commands.
+        unsafe {
+            // Safety: raw handles do not outlive the block.
+
+            let wait_semaphores = &[*self.image_available.as_mut().unwrap().handle_mut()];
+            // Only block rendering once ready to output to the color attachment.
+            let wait_dst_stage_mask = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let command_buffers =
+                &[*self.graphics_command_buffers[acquired.index as usize].handle_mut()];
+            let signal_semaphores = &[*self.render_complete.as_mut().unwrap().handle_mut()];
+
+            let submit_info = vk::SubmitInfoBuilder::new()
+                .wait_semaphores(wait_semaphores)
+                .wait_dst_stage_mask(wait_dst_stage_mask)
+                .command_buffers(command_buffers)
+                .signal_semaphores(signal_semaphores);
+
+            let submits = &[submit_info];
+
+            log::trace!("submitting draw commands");
+            device_read
+                .raw
+                .queue_submit(&mut graphics_queue_write.raw, submits, None)
+                .expect("failed to submit graphics command buffer");
+        }
+
+        let present_queue = self.device.present_queue();
+        let mut present_queue_write = present_queue.write_inner();
+
+        if graphics_present_differ {
+            // Submit present queue commands. This acquires the swapchain image
+            // from the graphics queue.
             unsafe {
+                let wait_semaphores = &[*self.render_complete.as_mut().unwrap().handle_mut()];
+                let wait_dst_stage_mask = &[vk::PipelineStageFlags::ALL_COMMANDS];
+                let command_buffers =
+                    &[*self.present_command_buffers[acquired.index as usize].handle_mut()];
+                let signal_semaphores =
+                    &[*self.present_queue_ownership.as_mut().unwrap().handle_mut()];
+
+                let submit_info = vk::SubmitInfoBuilder::new()
+                    .wait_semaphores(wait_semaphores)
+                    .wait_dst_stage_mask(wait_dst_stage_mask)
+                    .command_buffers(command_buffers)
+                    .signal_semaphores(signal_semaphores);
+
+                let submits = &[submit_info];
+
+                log::trace!("submitting presentation queue acquire");
                 device_read
                     .raw
-                    .begin_command_buffer(cmdbuf, &begin_info)
-                    .expect("failed to begin recording command buffer");
+                    .queue_submit(&mut present_queue_write.raw, submits, None)
+                    .expect("failed to submit command buffer");
             }
+        }
 
-            let clear_values = &[vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                },
-            }];
-            let pass_info = vks::RenderPassBeginInfoBuilder::new()
-                .render_pass(render_pass)
-                .framebuffer(framebuffer)
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.info.image_extent,
-                })
-                .clear_values(clear_values);
+        unsafe {
+            let present_wait_semaphore = if graphics_present_differ {
+                *self.present_queue_ownership.as_mut().unwrap().handle_mut()
+            } else {
+                *self.render_complete.as_mut().unwrap().handle_mut()
+            };
 
-            unsafe {
-                device_read.raw.cmd_begin_render_pass(
-                    cmdbuf,
-                    &pass_info,
-                    vk::SubpassContents::INLINE,
-                );
+            let wait_semaphores = &[present_wait_semaphore];
+            let swapchains = &[*self.swapchain.as_mut().unwrap().handle_mut()];
+            let image_indices = &[acquired.index];
 
-                device_read.raw.cmd_bind_pipeline(
-                    cmdbuf,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline,
-                );
+            let present_info = vk::PresentInfoKHRBuilder::new()
+                .wait_semaphores(wait_semaphores)
+                .swapchains(swapchains)
+                .image_indices(image_indices);
 
-                device_read.raw.cmd_draw(cmdbuf, 3, 1, 0, 0);
-                device_read.raw.cmd_end_render_pass(cmdbuf);
-            }
+            log::trace!("presenting swapchain image");
+            device_read
+                .raw
+                .queue_present_khr(&mut present_queue_write.raw, &present_info)
+                .expect("failed to present swapchain image");
+            device_read
+                .raw
+                .queue_wait_idle(&mut present_queue_write.raw)
+                .expect("failed to wait for presentation queue to become idle");
         }
     }
 

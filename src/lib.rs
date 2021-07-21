@@ -13,10 +13,9 @@ use std::{
 
 use arrayvec::ArrayVec;
 use erupt::vk;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use raw_window_handle::RawWindowHandle;
 use thread_local::ThreadLocal;
-use vks::VkObject;
 
 pub use debug_utils::DebugMessenger;
 pub use display::Display;
@@ -211,7 +210,8 @@ impl Instance {
             vks::Instance::create(&create_info).expect("failed to create raw Vulkan instance: {}")
         };
 
-        let instance_extensions =
+        // TODO: store in instance
+        let _instance_extensions =
             unsafe { entry.enumerate_instance_extension_properties(None, None) }
                 .expect("failed to enumerate instance extension properties");
 
@@ -318,7 +318,9 @@ impl Instance {
 pub struct PhysicalDeviceInner {
     instance: Instance,
     raw: vks::PhysicalDevice,
-    queue_families: Vec<vk::QueueFamilyProperties>,
+
+    // TODO: allow querying properties
+    _queue_families: Vec<vk::QueueFamilyProperties>,
     graphics_queue_family: u32,
     transfer_queue_family: u32,
     present_queue_family: u32,
@@ -469,7 +471,7 @@ impl PhysicalDevice {
             inner: Arc::new(PhysicalDeviceInner {
                 instance,
                 raw: phys_device,
-                queue_families,
+                _queue_families: queue_families,
                 graphics_queue_family,
                 transfer_queue_family,
                 present_queue_family,
@@ -554,7 +556,7 @@ impl PhysicalDevice {
 
             let queue = Queue {
                 inner: Arc::new(RwLock::new(QueueInner {
-                    device: inner.clone(),
+                    _device: inner.clone(),
                     raw: raw_queue,
                 })),
             };
@@ -727,6 +729,10 @@ impl DeviceQueues {
         self.queues[self.present as usize].clone()
     }
 
+    pub fn present_command_pool(&self) -> Arc<ThreadLocalCommandPool> {
+        self.cmd_pools[self.present as usize].clone()
+    }
+
     pub fn present_family_id(&self) -> u32 {
         self.family_ids[self.present as usize]
     }
@@ -778,6 +784,10 @@ impl Device {
         self.queues.present_queue()
     }
 
+    pub fn present_command_pool(&self) -> Arc<ThreadLocalCommandPool> {
+        self.queues.present_command_pool()
+    }
+
     pub fn present_family_id(&self) -> u32 {
         self.queues.present_family_id()
     }
@@ -792,6 +802,28 @@ impl Device {
     }
 
     unsafe fn create_render_pass(&self, target: &Display) -> vks::RenderPass {
+        let graphics_present_differ = self.graphics_family_id() != self.present_family_id();
+
+        let initial_layout = if graphics_present_differ {
+            // The image will be manually transitioned prior to beginning the
+            // render pass.
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            // The image will be automatically transitioned by the initial
+            // subpass dependency.
+            vk::ImageLayout::UNDEFINED
+        };
+
+        let final_layout = if graphics_present_differ {
+            // The image will be manually transitioned to PRESENT_SRC_KHR during
+            // QFOT to the present queue.
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            // The image will be automatically transitioned by ending the render
+            // pass.
+            vk::ImageLayout::PRESENT_SRC_KHR
+        };
+
         let color_attachment = vk::AttachmentDescriptionBuilder::new()
             .format(target.info().surface_format.format)
             .samples(vk::SampleCountFlagBits::_1)
@@ -799,11 +831,13 @@ impl Device {
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+            .initial_layout(initial_layout)
+            .final_layout(final_layout);
 
         let attachment_reference = vk::AttachmentReferenceBuilder::new()
             .attachment(0)
+            // The driver automatically transitions the color attachment to the
+            // correct layout.
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
         let color_attachments = &[attachment_reference];
@@ -811,11 +845,43 @@ impl Device {
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(color_attachments);
 
+        // If graphics and present operations are performed on the same queue
+        // family, then a subpass dependency is sufficient to synchronize access
+        // to the color attachment.
+        //
+        // If they are performed on different queue families, then a queue
+        // family ownership transfer is required from the graphics queue to the
+        // present queue. Subpass dependencies cannot encode ownership transfer;
+        // therefore, ordering of subpasses is enforced by the pipeline barriers
+        // used to perform the QFOT, and the subpass dependency is unnecessary.
+        let mut dependencies = ArrayVec::<_, 1>::new();
+        if self.graphics_family_id() == self.present_family_id() {
+            dependencies.push(
+                vk::SubpassDependencyBuilder::new()
+                    // Define a dependency between any prior (sub)passes and this one.
+                    .src_subpass(vk::SUBPASS_EXTERNAL)
+                    .dst_subpass(0)
+                    // Wait for the prior subpass to complete all operations on the
+                    // color attachment before performing any in this subpass.
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    // There are no writes pending; vkQueuePresentKHR guarantees that
+                    // writes to swapchain image memory are automatically made visible
+                    // after the semaphore signal and before the presentation engine
+                    // reads the image.
+                    .src_access_mask(vk::AccessFlags::empty())
+                    // Block writes to the color attachment until the previous subpass
+                    // is done with it, avoiding a write-after-read hazard.
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            );
+        };
+
         let attachments = &[color_attachment];
         let subpasses = &[subpass];
         let render_pass_info = vk::RenderPassCreateInfoBuilder::new()
             .attachments(attachments)
-            .subpasses(subpasses);
+            .subpasses(subpasses)
+            .dependencies(&dependencies);
 
         let render_pass = unsafe { self.inner.read().raw.create_render_pass(&render_pass_info) }
             .expect("failed to create render pass");
@@ -967,7 +1033,7 @@ impl Device {
     }
 }
 
-struct QueueInner {
+pub struct QueueInner {
     // NOTE: sensitive drop order
 
     // Queue does not need to be manually destroyed, but it must not be used
@@ -976,12 +1042,22 @@ struct QueueInner {
 
     // Hold a reference to the `DeviceInner` (rather than the `Device`) to avoid
     // circular `Arc`s.
-    device: Arc<RwLock<DeviceInner>>,
+    _device: Arc<RwLock<DeviceInner>>,
 }
 
 #[derive(Clone)]
 pub struct Queue {
     inner: Arc<RwLock<QueueInner>>,
+}
+
+impl Queue {
+    pub fn read_inner(&self) -> RwLockReadGuard<'_, QueueInner> {
+        self.inner.read()
+    }
+
+    pub fn write_inner(&self) -> RwLockWriteGuard<'_, QueueInner> {
+        self.inner.write()
+    }
 }
 
 struct SurfaceInner {
@@ -1032,7 +1108,7 @@ struct SwapchainInner {
     // NOTE: sensitive drop order.
     raw: Option<vks::SwapchainKHR>,
     device: Device,
-    surface: Surface,
+    _surface: Surface,
 }
 
 impl Drop for SwapchainInner {

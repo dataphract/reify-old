@@ -7,7 +7,7 @@
 //! that a parameter be externally synchronized accept the object type either by
 //! mutable reference or by value (in case the function may destroy the object).
 
-use erupt::{vk, DeviceLoader, EntryLoader, InstanceLoader, LoaderError};
+use erupt::{utils::VulkanResult, vk, DeviceLoader, EntryLoader, InstanceLoader, LoaderError};
 
 use std::{convert::TryInto, ffi::CStr, lazy::SyncOnceCell, time::Duration};
 
@@ -505,6 +505,23 @@ impl Device {
         }
     }
 
+    pub unsafe fn queue_submit(
+        &self,
+        queue: &mut Queue,
+        submits: &[vk::SubmitInfoBuilder<'_>],
+        fence: Option<&mut Fence>,
+    ) -> VkResult<()> {
+        unsafe {
+            self.loader
+                .queue_submit(*queue.handle_mut(), submits, fence.map(|f| *f.handle_mut()))
+                .result()
+        }
+    }
+
+    pub unsafe fn queue_wait_idle(&self, queue: &mut Queue) -> VkResult<()> {
+        unsafe { self.loader.queue_wait_idle(*queue.handle_mut()).result() }
+    }
+
     // ------------------------------------------------------------------------
 
     /// Creates an image view from an existing image.
@@ -774,13 +791,14 @@ impl Device {
     /// The caller must uphold the following invariants:
     /// - `command_buffer` must be a handle to a command buffer object
     ///   associated with this device.
+    #[inline]
     pub unsafe fn begin_command_buffer(
         &self,
         command_buffer: &mut CommandBuffer,
         begin_info: &vk::CommandBufferBeginInfoBuilder<'_>,
     ) -> VkResult<()> {
         unsafe {
-            // Safety: command_buffer is externally syncronized via mutable reference.
+            // Safety: command_buffer is externally synchronized via mutable reference.
             self.loader
                 .begin_command_buffer(*command_buffer.handle_mut(), begin_info)
                 .result()?;
@@ -789,6 +807,49 @@ impl Device {
         Ok(())
     }
 
+    /// Finishes recording a command buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - `command_buffer` must be a handle to a command buffer object
+    ///   associated with this device.
+    /// - `command_buffer` must be in the recording state.
+    /// - TODO: more valid usage details
+    #[inline]
+    pub unsafe fn end_command_buffer(&self, command_buffer: &mut CommandBuffer) -> VkResult<()> {
+        unsafe {
+            self.loader
+                .end_command_buffer(*command_buffer.handle_mut())
+                .result()
+        }
+    }
+
+    #[inline]
+    pub unsafe fn cmd_pipeline_barrier(
+        &self,
+        command_buffer: &mut CommandBuffer,
+        src_stage_mask: vk::PipelineStageFlags,
+        dst_stage_mask: vk::PipelineStageFlags,
+        dependency_flags: vk::DependencyFlags,
+        memory_barriers: &[vk::MemoryBarrierBuilder<'_>],
+        buffer_memory_barriers: &[vk::BufferMemoryBarrierBuilder<'_>],
+        image_memory_barriers: &[vk::ImageMemoryBarrierBuilder<'_>],
+    ) {
+        unsafe {
+            self.loader.cmd_pipeline_barrier(
+                *command_buffer.handle_mut(),
+                src_stage_mask,
+                dst_stage_mask,
+                Some(dependency_flags),
+                memory_barriers,
+                buffer_memory_barriers,
+                image_memory_barriers,
+            );
+        }
+    }
+
+    #[inline]
     pub unsafe fn cmd_begin_render_pass(
         &self,
         command_buffer: &mut CommandBuffer,
@@ -1020,6 +1081,51 @@ impl Device {
                 .into_iter()
                 .map(|img| Image::new(img))
                 .collect())
+        }
+    }
+
+    pub unsafe fn acquire_next_image_khr(
+        &self,
+        swapchain: &mut SwapchainKHR,
+        timeout: Option<Duration>,
+        semaphore: Option<&mut Semaphore>,
+        fence: Option<&mut Fence>,
+    ) -> VkResult<AcquiredImage> {
+        let timeout_ns: u64 = timeout
+            .map(|t| {
+                t.as_nanos()
+                    .try_into()
+                    .expect("acquire_next_image_khr: timeout overflowed u64")
+            })
+            .unwrap_or(u64::MAX);
+
+        let VulkanResult { raw, value } = unsafe {
+            self.loader.acquire_next_image_khr(
+                *swapchain.handle_mut(),
+                timeout_ns,
+                semaphore.map(|s| *s.handle_mut()),
+                fence.map(|f| *f.handle_mut()),
+            )
+        };
+
+        match value {
+            Some(v) => Ok(AcquiredImage {
+                status: raw,
+                index: v,
+            }),
+            None => Err(raw),
+        }
+    }
+
+    pub unsafe fn queue_present_khr(
+        &self,
+        queue: &mut Queue,
+        present_info: &vk::PresentInfoKHRBuilder<'_>,
+    ) -> VkResult<()> {
+        unsafe {
+            self.loader
+                .queue_present_khr(*queue.handle_mut(), present_info)
+                .result()
         }
     }
 }
@@ -1294,6 +1400,31 @@ define_handle! {
 
 // ============================================================================
 
+define_delegated_builder! {
+    pub struct ImageMemoryBarrierBuilder<'a> {
+        inner: vk::ImageMemoryBarrierBuilder<'a>,
+    }
+
+    impl ImageMemoryBarrierBuilder {
+        pub fn src_access_mask(vk::AccessFlags) -> Self;
+        pub fn dst_access_mask(vk::AccessFlags) -> Self;
+        pub fn old_layout(vk::ImageLayout) -> Self;
+        pub fn new_layout(vk::ImageLayout) -> Self;
+        pub fn src_queue_family_index(u32) -> Self;
+        pub fn dst_queue_family_index(u32) -> Self;
+        pub fn subresource_range(vk::ImageSubresourceRange) -> Self;
+    }
+}
+
+impl<'a> ImageMemoryBarrierBuilder<'a> {
+    pub fn image(mut self, image: &Image) -> Self {
+        self.inner = self.inner.image(unsafe { *image.handle() });
+        self
+    }
+}
+
+// ============================================================================
+
 define_handle! {
     /// An opaque handle to a Vulkan surface object.
     pub struct SurfaceKHR(vk::SurfaceKHR);
@@ -1322,6 +1453,11 @@ pub struct SwapchainCreateInfo<'surf, 'queues> {
     pub present_mode: vk::PresentModeKHR,
     pub clipped: bool,
     pub old_swapchain: Option<SwapchainKHR>,
+}
+
+pub struct AcquiredImage {
+    pub status: vk::Result,
+    pub index: u32,
 }
 
 // ============================================================================

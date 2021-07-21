@@ -1,8 +1,9 @@
 use erupt::vk;
 use raw_window_handle::HasRawWindowHandle;
-use reify::{Instance, SwapchainCreateInfo};
+use reify::Instance;
 use shaderc::{Compiler, ShaderKind};
 use winit::{
+    event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
@@ -58,14 +59,25 @@ pub fn main() {
         display.record_command_buffers(pipeline_read.render_pass(), pipeline_read.pipeline());
     }
 
-    event_loop.run(move |event, _target, flow| match event {
-        winit::event::Event::WindowEvent {
-            window_id: _,
-            event,
-        } => match event {
-            winit::event::WindowEvent::CloseRequested => *flow = ControlFlow::Exit,
+    let mut frames = 0;
+    event_loop.run(move |event, _target, flow| {
+        *flow = winit::event_loop::ControlFlow::Poll;
+
+        match event {
+            Event::MainEventsCleared => {
+                display.draw();
+                log::debug!("frame {}: draw complete.", frames);
+                frames += 1;
+            }
+
+            Event::WindowEvent {
+                window_id: _,
+                event,
+            } => match event {
+                WindowEvent::CloseRequested => *flow = ControlFlow::Exit,
+                _ => (),
+            },
             _ => (),
-        },
-        _ => (),
+        }
     });
 }

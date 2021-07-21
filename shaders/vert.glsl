@@ -1,9 +1,9 @@
 #version 450
 
 const vec2 vertices[3] = {
-    vec2(0.0f, 0.0f),
-    vec2(1.0f, 0.0f),
-    vec2(0.5f, 1.0f)
+    vec2(-1.0f, 1.0f),
+    vec2(1.0f, 1.0f),
+    vec2(0.0f, -1.0f)
 };
 
 void main() {
