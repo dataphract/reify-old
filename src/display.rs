@@ -12,6 +12,68 @@ const SWAPCHAIN_CHOOSES_EXTENT: vk::Extent2D = vk::Extent2D {
     height: u32::MAX,
 };
 
+/// A set of synchronization primitives used to control rendering a frame.
+pub struct FrameInFlight {
+    // If unsignaled, the frame is currently in flight.
+    in_flight: vks::Fence,
+
+    image_available: vks::Semaphore,
+    render_complete: vks::Semaphore,
+
+    // Only used if graphics and present queues are from different families.
+    present_queue_ownership: vks::Semaphore,
+}
+
+impl FrameInFlight {
+    fn destroy_with(self, device: &vks::Device) {
+        let FrameInFlight {
+            in_flight,
+            image_available,
+            render_complete,
+            present_queue_ownership,
+        } = self;
+
+        unsafe {
+            device.destroy_fence(in_flight);
+            device.destroy_semaphore(image_available);
+            device.destroy_semaphore(render_complete);
+            device.destroy_semaphore(present_queue_ownership);
+        }
+    }
+}
+
+/// A swapchain image, along with the resources used to render to it.
+pub struct SwapchainImage {
+    present_commands: vks::CommandBuffer,
+    graphics_commands: vks::CommandBuffer,
+    framebuffer: Option<vks::Framebuffer>,
+    view: vks::ImageView,
+    image: vks::Image,
+}
+
+impl SwapchainImage {
+    fn destroy_with(self, device: &vks::Device) {
+        let SwapchainImage {
+            framebuffer,
+            view,
+            // Command buffers are destroyed automatically along with their
+            // owning pools.
+            present_commands: _,
+            graphics_commands: _,
+            // Swapchain images are destroyed automatically along with their
+            // owning swapchain.
+            image: _,
+        } = self;
+
+        unsafe {
+            if let Some(fb) = framebuffer {
+                device.destroy_framebuffer(fb);
+            }
+            device.destroy_image_view(view);
+        }
+    }
+}
+
 pub struct DisplayInfo {
     pub min_image_count: u32,
     pub surface_format: vk::SurfaceFormatKHR,
@@ -22,17 +84,8 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
-    image_available: Option<vks::Semaphore>,
-    render_complete: Option<vks::Semaphore>,
-
-    // Only used if graphics and present queues are from different families.
-    present_queue_ownership: Option<vks::Semaphore>,
-
-    graphics_command_buffers: Vec<vks::CommandBuffer>,
-    present_command_buffers: Vec<vks::CommandBuffer>,
-    framebuffers: Vec<vks::Framebuffer>,
-    image_views: Vec<vks::ImageView>,
-    images: Vec<vks::Image>,
+    frame: FrameInFlight,
+    images: Vec<SwapchainImage>,
     swapchain: Option<vks::SwapchainKHR>,
     surface: Option<vks::SurfaceKHR>,
     device: Device,
@@ -42,34 +95,12 @@ impl Drop for Display {
     fn drop(&mut self) {
         let device_read = self.device.inner.read();
 
-        if let Some(sem) = self.image_available.take() {
-            unsafe { device_read.raw.destroy_semaphore(sem) };
-        }
+        // TODO
+        // self.frame.destroy_with(&device_read.raw);
 
-        if let Some(sem) = self.render_complete.take() {
-            unsafe { device_read.raw.destroy_semaphore(sem) };
+        for si in self.images.drain(..) {
+            si.destroy_with(&device_read.raw)
         }
-
-        if let Some(sem) = self.present_queue_ownership.take() {
-            unsafe { device_read.raw.destroy_semaphore(sem) };
-        }
-
-        for framebuffer in self.framebuffers.drain(..) {
-            unsafe {
-                device_read.raw.destroy_framebuffer(framebuffer);
-            }
-        }
-
-        for image_view in self.image_views.drain(..) {
-            unsafe {
-                // TODO: must allow commands to complete on image views before
-                // destroying
-                device_read.raw.destroy_image_view(image_view);
-            }
-        }
-
-        // Swapchain images do not need to be explicitly destroyed, as they are
-        // managed by the swapchain.
 
         if let Some(swapchain) = self.swapchain.take() {
             unsafe {
@@ -256,12 +287,33 @@ impl Display {
                 .expect("failed to allocate command buffers")
         };
 
+        let swapchain_images = images
+            .into_iter()
+            .zip(image_views)
+            .zip(graphics_command_buffers)
+            .zip(present_command_buffers)
+            .map(
+                |(((image, view), graphics_commands), present_commands)| SwapchainImage {
+                    present_commands,
+                    graphics_commands,
+                    framebuffer: None,
+                    view,
+                    image,
+                },
+            )
+            .collect::<Vec<_>>();
+
         let info = DisplayInfo {
             min_image_count,
             surface_format,
             image_extent,
             present_mode,
         };
+
+        let fence_create_info =
+            vk::FenceCreateInfoBuilder::new().flags(vk::FenceCreateFlags::SIGNALED);
+        let in_flight = unsafe { device_read.raw.create_fence(&fence_create_info) }
+            .expect("failed to create in_flight fence");
 
         let semaphore_create_info = vk::SemaphoreCreateInfoBuilder::new();
         let image_available = unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
@@ -273,15 +325,14 @@ impl Display {
                 .expect("failed to create present_queue_ownership semaphore");
 
         Display {
-            image_available: Some(image_available),
-            render_complete: Some(render_complete),
-            present_queue_ownership: Some(present_queue_ownership),
+            frame: FrameInFlight {
+                in_flight,
+                image_available,
+                render_complete,
+                present_queue_ownership,
+            },
             info,
-            graphics_command_buffers,
-            present_command_buffers,
-            framebuffers: Vec::new(),
-            image_views,
-            images,
+            images: swapchain_images,
             swapchain: Some(swapchain),
             surface: Some(surface),
             device: device.clone(),
@@ -289,12 +340,10 @@ impl Display {
     }
 
     pub fn rebuild_framebuffers(&mut self, render_pass: &vks::RenderPass) {
-        self.framebuffers.clear();
-
-        for view in self.image_views.iter() {
+        for image in self.images.iter_mut() {
             unsafe {
                 // Safety: raw handle does not outlive the block.
-                let attachments = &[*view.handle()];
+                let attachments = &[*image.view.handle()];
 
                 let create_info = vks::FramebufferCreateInfoBuilder::new()
                     .flags(vk::FramebufferCreateFlags::empty())
@@ -311,7 +360,9 @@ impl Display {
                     .create_framebuffer(&create_info)
                     .expect("failed to create framebuffer");
 
-                self.framebuffers.push(framebuffer);
+                if let Some(fb) = image.framebuffer.replace(framebuffer) {
+                    self.device.read_inner().raw.destroy_framebuffer(fb);
+                }
             }
         }
     }
@@ -323,8 +374,10 @@ impl Display {
         index: usize,
     ) {
         let device_read = self.device.read_inner();
-        let cmdbuf = &mut self.graphics_command_buffers[index];
-        let framebuffer = &self.framebuffers[index];
+
+        let image = &mut self.images[index];
+        let cmdbuf = &mut image.graphics_commands;
+        let framebuffer = image.framebuffer.as_ref().unwrap();
         let graphics_present_differ =
             self.device.graphics_family_id() != self.device.present_family_id();
 
@@ -359,7 +412,7 @@ impl Display {
                 // to perform a QFOT here.
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(&self.images[index])
+                .image(&image.image)
                 .subresource_range(subresource_range);
 
             unsafe {
@@ -427,7 +480,7 @@ impl Display {
                 // Release ownership from graphics queue to present queue.
                 .src_queue_family_index(self.device.graphics_family_id())
                 .dst_queue_family_index(self.device.present_family_id())
-                .image(&self.images[index])
+                .image(&image.image)
                 .subresource_range(subresource_range);
 
             unsafe {
@@ -472,8 +525,8 @@ impl Display {
             self.record_graphics_command_buffer(render_pass, pipeline, index);
             let device_read = self.device.read_inner();
             if graphics_present_differ {
-                let cmdbuf = &mut self.present_command_buffers[index];
-                let image = &self.images[index];
+                let image = &mut self.images[index];
+                let cmdbuf = &mut image.present_commands;
 
                 let begin_info = vk::CommandBufferBeginInfoBuilder::new()
                     .flags(vk::CommandBufferUsageFlags::empty());
@@ -504,7 +557,7 @@ impl Display {
                         .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                         .src_queue_family_index(self.device.graphics_family_id())
                         .dst_queue_family_index(self.device.present_family_id())
-                        .image(*image.handle())
+                        .image(*image.image.handle())
                         .subresource_range(subresource_range);
 
                     device_read.raw.cmd_pipeline_barrier(
@@ -537,7 +590,7 @@ impl Display {
             device_read.raw.acquire_next_image_khr(
                 self.swapchain.as_mut().unwrap(),
                 None,
-                Some(self.image_available.as_mut().unwrap()),
+                Some(&mut self.frame.image_available),
                 None,
             )
         }
@@ -550,12 +603,13 @@ impl Display {
         unsafe {
             // Safety: raw handles do not outlive the block.
 
-            let wait_semaphores = &[*self.image_available.as_mut().unwrap().handle_mut()];
+            let wait_semaphores = &[*self.frame.image_available.handle_mut()];
             // Only block rendering once ready to output to the color attachment.
             let wait_dst_stage_mask = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers =
-                &[*self.graphics_command_buffers[acquired.index as usize].handle_mut()];
-            let signal_semaphores = &[*self.render_complete.as_mut().unwrap().handle_mut()];
+            let command_buffers = &[*self.images[acquired.index as usize]
+                .graphics_commands
+                .handle_mut()];
+            let signal_semaphores = &[*self.frame.render_complete.handle_mut()];
 
             let submit_info = vk::SubmitInfoBuilder::new()
                 .wait_semaphores(wait_semaphores)
@@ -579,12 +633,12 @@ impl Display {
             // Submit present queue commands. This acquires the swapchain image
             // from the graphics queue.
             unsafe {
-                let wait_semaphores = &[*self.render_complete.as_mut().unwrap().handle_mut()];
+                let wait_semaphores = &[*self.frame.render_complete.handle_mut()];
                 let wait_dst_stage_mask = &[vk::PipelineStageFlags::ALL_COMMANDS];
-                let command_buffers =
-                    &[*self.present_command_buffers[acquired.index as usize].handle_mut()];
-                let signal_semaphores =
-                    &[*self.present_queue_ownership.as_mut().unwrap().handle_mut()];
+                let command_buffers = &[*self.images[acquired.index as usize]
+                    .present_commands
+                    .handle_mut()];
+                let signal_semaphores = &[*self.frame.present_queue_ownership.handle_mut()];
 
                 let submit_info = vk::SubmitInfoBuilder::new()
                     .wait_semaphores(wait_semaphores)
@@ -604,9 +658,9 @@ impl Display {
 
         unsafe {
             let present_wait_semaphore = if graphics_present_differ {
-                *self.present_queue_ownership.as_mut().unwrap().handle_mut()
+                *self.frame.present_queue_ownership.handle_mut()
             } else {
-                *self.render_complete.as_mut().unwrap().handle_mut()
+                *self.frame.render_complete.handle_mut()
             };
 
             let wait_semaphores = &[present_wait_semaphore];
