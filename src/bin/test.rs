@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use erupt::vk;
 use raw_window_handle::HasRawWindowHandle;
 use reify::Instance;
@@ -60,14 +62,20 @@ pub fn main() {
     }
 
     let mut frames = 0;
+    let mut last_frame = Instant::now();
     event_loop.run(move |event, _target, flow| {
         *flow = winit::event_loop::ControlFlow::Poll;
 
         match event {
             Event::MainEventsCleared => {
-                display.draw();
-                log::debug!("frame {}: draw complete.", frames);
-                frames += 1;
+                if last_frame.elapsed() > Duration::from_micros(16666) {
+                    last_frame = Instant::now();
+                    display.draw();
+                    log::debug!("frame {}: draw complete.", frames);
+                    frames += 1;
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
 
             Event::WindowEvent {

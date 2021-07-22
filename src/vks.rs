@@ -950,16 +950,24 @@ impl Device {
         }
     }
 
+    pub unsafe fn reset_fences(&self, fences: &[vk::Fence]) -> VkResult<()> {
+        unsafe { self.loader.reset_fences(fences).result() }
+    }
+
     pub unsafe fn wait_for_fences(
         &self,
         fences: &[vk::Fence],
         wait_all: bool,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> VkResult<FenceWaitStatus> {
         let timeout_ns: u64 = timeout
-            .as_nanos()
-            .try_into()
-            .expect("wait_for_fences: timeout overflowed u64");
+            .map(|dur| {
+                dur.as_nanos()
+                    .try_into()
+                    .expect("wait_for_fences: timeout overflowed u64")
+            })
+            .unwrap_or(u64::MAX);
+
         unsafe {
             match self
                 .loader

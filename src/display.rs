@@ -1,5 +1,6 @@
 use std::cmp;
 
+use arrayvec::ArrayVec;
 use erupt::vk;
 
 use crate::{
@@ -7,6 +8,7 @@ use crate::{
     Device,
 };
 
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const SWAPCHAIN_CHOOSES_EXTENT: vk::Extent2D = vk::Extent2D {
     width: u32::MAX,
     height: u32::MAX,
@@ -84,8 +86,12 @@ pub struct DisplayInfo {
 pub struct Display {
     info: DisplayInfo,
 
-    frame: FrameInFlight,
+    current_frame: u64,
+
+    frames: ArrayVec<FrameInFlight, MAX_FRAMES_IN_FLIGHT>,
     images: Vec<SwapchainImage>,
+    image_frames: Vec<Option<usize>>,
+
     swapchain: Option<vks::SwapchainKHR>,
     surface: Option<vks::SurfaceKHR>,
     device: Device,
@@ -310,29 +316,41 @@ impl Display {
             present_mode,
         };
 
-        let fence_create_info =
-            vk::FenceCreateInfoBuilder::new().flags(vk::FenceCreateFlags::SIGNALED);
-        let in_flight = unsafe { device_read.raw.create_fence(&fence_create_info) }
-            .expect("failed to create in_flight fence");
+        let mut frames = ArrayVec::new();
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let fence_create_info =
+                vk::FenceCreateInfoBuilder::new().flags(vk::FenceCreateFlags::SIGNALED);
+            let in_flight = unsafe { device_read.raw.create_fence(&fence_create_info) }
+                .expect("failed to create in_flight fence");
 
-        let semaphore_create_info = vk::SemaphoreCreateInfoBuilder::new();
-        let image_available = unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
-            .expect("failed to create image_available semaphore");
-        let render_complete = unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
-            .expect("failed to create render_complete semaphore");
-        let present_queue_ownership =
-            unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
-                .expect("failed to create present_queue_ownership semaphore");
+            let semaphore_create_info = vk::SemaphoreCreateInfoBuilder::new();
+            let image_available =
+                unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
+                    .expect("failed to create image_available semaphore");
+            let render_complete =
+                unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
+                    .expect("failed to create render_complete semaphore");
+            let present_queue_ownership =
+                unsafe { device_read.raw.create_semaphore(&semaphore_create_info) }
+                    .expect("failed to create present_queue_ownership semaphore");
 
-        Display {
-            frame: FrameInFlight {
+            frames.push(FrameInFlight {
                 in_flight,
                 image_available,
                 render_complete,
                 present_queue_ownership,
-            },
+            });
+        }
+
+        let mut image_frames = Vec::with_capacity(swapchain_images.len());
+        image_frames.resize(swapchain_images.len(), None);
+
+        Display {
             info,
+            current_frame: 0,
+            frames,
             images: swapchain_images,
+            image_frames,
             swapchain: Some(swapchain),
             surface: Some(surface),
             device: device.clone(),
@@ -586,16 +604,43 @@ impl Display {
         let graphics_present_differ =
             self.device.graphics_family_id() != self.device.present_family_id();
 
+        let frame = &mut self.frames[self.current_frame as usize % MAX_FRAMES_IN_FLIGHT];
+
+        // Wait for the next frame to become available.
+        unsafe {
+            device_read
+                .raw
+                .wait_for_fences(&[*frame.in_flight.handle()], true, None)
+        }
+        .expect("failed to wait for frame to become available");
+
+        // Acquire an image from the swapchain.
         let acquired = unsafe {
             device_read.raw.acquire_next_image_khr(
                 self.swapchain.as_mut().unwrap(),
                 None,
-                Some(&mut self.frame.image_available),
+                Some(&mut frame.image_available),
                 None,
             )
         }
         .expect("failed to acquire next swapchain image");
 
+        // Wait for any previous operations on the acquired image to complete.
+        drop(frame);
+        if let Some(frame_index) = self.image_frames[acquired.index as usize] {
+            unsafe {
+                device_read.raw.wait_for_fences(
+                    &[*self.frames[frame_index % MAX_FRAMES_IN_FLIGHT]
+                        .in_flight
+                        .handle()],
+                    true,
+                    None,
+                )
+            }
+            .expect("failed to wait for previous image frame");
+        }
+
+        let frame = &mut self.frames[self.current_frame as usize % MAX_FRAMES_IN_FLIGHT];
         let graphics_queue = self.device.graphics_queue();
         let mut graphics_queue_write = graphics_queue.write_inner();
 
@@ -603,13 +648,13 @@ impl Display {
         unsafe {
             // Safety: raw handles do not outlive the block.
 
-            let wait_semaphores = &[*self.frame.image_available.handle_mut()];
+            let wait_semaphores = &[*frame.image_available.handle_mut()];
             // Only block rendering once ready to output to the color attachment.
             let wait_dst_stage_mask = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = &[*self.images[acquired.index as usize]
                 .graphics_commands
                 .handle_mut()];
-            let signal_semaphores = &[*self.frame.render_complete.handle_mut()];
+            let signal_semaphores = &[*frame.render_complete.handle_mut()];
 
             let submit_info = vk::SubmitInfoBuilder::new()
                 .wait_semaphores(wait_semaphores)
@@ -619,10 +664,22 @@ impl Display {
 
             let submits = &[submit_info];
 
+            // If the image will be presented on another queue, don't signal the
+            // frame-in-flight fence here.
+            let signal_fence = if graphics_present_differ {
+                None
+            } else {
+                device_read
+                    .raw
+                    .reset_fences(&[*frame.in_flight.handle_mut()])
+                    .expect("failed to reset in-flight fence");
+                Some(&mut frame.in_flight)
+            };
+
             log::trace!("submitting draw commands");
             device_read
                 .raw
-                .queue_submit(&mut graphics_queue_write.raw, submits, None)
+                .queue_submit(&mut graphics_queue_write.raw, submits, signal_fence)
                 .expect("failed to submit graphics command buffer");
         }
 
@@ -633,12 +690,12 @@ impl Display {
             // Submit present queue commands. This acquires the swapchain image
             // from the graphics queue.
             unsafe {
-                let wait_semaphores = &[*self.frame.render_complete.handle_mut()];
+                let wait_semaphores = &[*frame.render_complete.handle_mut()];
                 let wait_dst_stage_mask = &[vk::PipelineStageFlags::ALL_COMMANDS];
                 let command_buffers = &[*self.images[acquired.index as usize]
                     .present_commands
                     .handle_mut()];
-                let signal_semaphores = &[*self.frame.present_queue_ownership.handle_mut()];
+                let signal_semaphores = &[*frame.present_queue_ownership.handle_mut()];
 
                 let submit_info = vk::SubmitInfoBuilder::new()
                     .wait_semaphores(wait_semaphores)
@@ -648,19 +705,28 @@ impl Display {
 
                 let submits = &[submit_info];
 
+                device_read
+                    .raw
+                    .reset_fences(&[*frame.in_flight.handle_mut()])
+                    .expect("failed to reset in-flight fence");
+
                 log::trace!("submitting presentation queue acquire");
                 device_read
                     .raw
-                    .queue_submit(&mut present_queue_write.raw, submits, None)
+                    .queue_submit(
+                        &mut present_queue_write.raw,
+                        submits,
+                        Some(&mut frame.in_flight),
+                    )
                     .expect("failed to submit command buffer");
             }
         }
 
         unsafe {
             let present_wait_semaphore = if graphics_present_differ {
-                *self.frame.present_queue_ownership.handle_mut()
+                *frame.present_queue_ownership.handle_mut()
             } else {
-                *self.frame.render_complete.handle_mut()
+                *frame.render_complete.handle_mut()
             };
 
             let wait_semaphores = &[present_wait_semaphore];
@@ -677,11 +743,9 @@ impl Display {
                 .raw
                 .queue_present_khr(&mut present_queue_write.raw, &present_info)
                 .expect("failed to present swapchain image");
-            device_read
-                .raw
-                .queue_wait_idle(&mut present_queue_write.raw)
-                .expect("failed to wait for presentation queue to become idle");
         }
+
+        self.current_frame += 1;
     }
 
     pub fn info(&self) -> &DisplayInfo {
