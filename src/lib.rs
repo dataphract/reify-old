@@ -3,6 +3,9 @@
 
 mod debug_utils;
 mod display;
+pub mod graph;
+mod shader;
+mod util;
 pub mod vks;
 
 use std::{

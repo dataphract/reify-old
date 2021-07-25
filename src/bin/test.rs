@@ -2,13 +2,47 @@ use std::time::{Duration, Instant};
 
 use erupt::vk;
 use raw_window_handle::HasRawWindowHandle;
-use reify::Instance;
+use reify::{
+    graph::{ClearColorValue, ImageInfo, ImageSize, RenderGraphBuilder, RenderPass},
+    Instance,
+};
 use shaderc::{Compiler, ShaderKind};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+
+pub struct TrianglePass;
+
+impl RenderPass for TrianglePass {
+    fn clear_color_value(&self) -> Option<ClearColorValue> {
+        Some(ClearColorValue::Float32([0.0, 0.0, 0.0, 1.0]))
+    }
+
+    fn record(&self, device: &reify::vks::Device, cmdbuf: &mut reify::vks::CommandBuffer) {
+        todo!()
+    }
+}
+
+fn build_graph() {
+    let mut graph = RenderGraphBuilder::new();
+
+    let mut tri = graph.add_render_pass("triangle", TrianglePass);
+    let color_out = tri
+        .add_color_attachment(
+            "triangle color attachment",
+            ImageInfo {
+                size: ImageSize::SAME_AS_SWAPCHAIN,
+                format: vk::Format::B8G8R8A8_SRGB,
+            },
+            None,
+        )
+        .unwrap();
+    tri.finish();
+
+    todo!();
+}
 
 pub fn main() {
     env_logger::init();
