@@ -29,7 +29,7 @@ where
                 let valid =
                     unsafe { std::str::from_utf8_unchecked(&unvalidated[..e.valid_up_to()]) };
 
-                f.write_str(valid);
+                f.write_str(valid)?;
                 f.write_char(char::REPLACEMENT_CHARACTER)?;
                 match e.error_len() {
                     // Skip the validated substring and the unrecognized sequence.

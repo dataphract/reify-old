@@ -6,11 +6,15 @@
 //! image) is represented by consuming the original image and producing a new
 //! one.
 
-use std::{collections::VecDeque, convert::TryInto, fmt};
+use std::{collections::VecDeque, convert::TryInto, fmt, time::Instant};
 
 use arrayvec::ArrayVec;
 use erupt::vk;
-use petgraph::{graph::NodeIndex, Directed};
+use petgraph::{
+    graph::NodeIndex,
+    visit::{EdgeRef, IntoEdgeReferences, IntoNodeReferences, NodeRef},
+    Directed,
+};
 use thiserror::Error;
 use tinyvec::TinyVec;
 
@@ -300,7 +304,7 @@ impl<'a> RenderPassBuilder<'a> {
             });
         }
 
-        if self.pass.consumes.insert(id) {
+        if !self.pass.consumes.insert(id) {
             return Err(RenderGraphError::AlreadyAccessed {
                 ty: AccessType::Consume,
                 r_name: name.to_owned(),
@@ -325,7 +329,7 @@ impl<'a> RenderPassBuilder<'a> {
             });
         }
 
-        if self.pass.reads.insert(id) {
+        if !self.pass.reads.insert(id) {
             return Err(RenderGraphError::AlreadyAccessed {
                 ty: AccessType::Read,
                 r_name: name.to_owned(),
@@ -354,6 +358,14 @@ impl<'a> RenderPassBuilder<'a> {
         self.pass.produces.insert(id);
 
         Ok(id)
+    }
+
+    pub fn add_input_attachment(&mut self, id: ResourceId) -> Result<(), RenderGraphError> {
+        self.add_read(id)?;
+
+        self.pass.input_attachments.push(id);
+
+        Ok(())
     }
 
     /// Adds a color attachment to the render pass.
@@ -410,6 +422,7 @@ impl<'a> RenderPassBuilder<'a> {
         }
 
         self.graph.passes.push(self.pass);
+        self.graph.pass_names.push(self.name);
 
         id
     }
@@ -429,6 +442,7 @@ pub struct RenderPassNode {
     // TODO: Ideally, avoid boxing render passes.
     pass: Box<dyn RenderPass>,
 
+    input_attachments: TinyVec<[ResourceId; 4]>,
     color_attachments: TinyVec<[ColorAttachment; 4]>,
 
     // Associated resources by access type.
@@ -459,6 +473,7 @@ pub struct RenderGraphBuilder {
     resource_names: Vec<String>,
 
     passes: Vec<RenderPassNode>,
+    pass_names: Vec<String>,
 
     final_image: Option<ResourceId>,
 }
@@ -500,6 +515,10 @@ impl RenderGraphBuilder {
             .ok_or(RenderGraphError::NoSuchRenderPass(id))
     }
 
+    fn render_pass_name(&self, id: RenderPassId) -> Option<&str> {
+        self.pass_names.get(id.id as usize).map(String::as_str)
+    }
+
     fn add_resource<S: AsRef<str>>(&mut self, name: S, ty: ResourceType) -> ResourceId {
         let id = ResourceId {
             id: self
@@ -526,22 +545,17 @@ impl RenderGraphBuilder {
         self.add_resource(name, ResourceType::Image(info))
     }
 
-    pub fn add_swapchain_image<S: AsRef<str>>(
-        &mut self,
-        name: S,
-        info: ImageInfo,
-    ) -> Result<ResourceId, RenderGraphError> {
-        if let Some(old_id) = self.final_image.clone() {
+    pub fn set_final_image(&mut self, id: ResourceId) -> Result<(), RenderGraphError> {
+        if let Some(old_id) = self.final_image {
             return Err(RenderGraphError::AlreadySetSwapchainImage {
                 old_id,
                 old_name: self.resource_name(old_id).unwrap().into(),
-                new_name: name.as_ref().into(),
+                new_name: self.resource_name(id).unwrap().into(),
             });
         }
 
-        let id = self.add_image(name, info);
         self.final_image = Some(id);
-        Ok(id)
+        Ok(())
     }
 
     #[inline]
@@ -580,6 +594,7 @@ impl RenderGraphBuilder {
             graph: self,
             pass: RenderPassNode {
                 pass: Box::new(pass),
+                input_attachments: TinyVec::new(),
                 color_attachments: TinyVec::new(),
                 consumes: SmallSet::new(),
                 reads: SmallSet::new(),
@@ -587,6 +602,54 @@ impl RenderGraphBuilder {
                 node_idx: None,
             },
         }
+    }
+
+    fn gen_dotgraph(&self, graph: &PassGraph) -> String {
+        use petgraph::dot;
+
+        fn pass_attributes<G>(builder: &RenderGraphBuilder) -> impl Fn(G, G::NodeRef) -> String + '_
+        where
+            G: IntoNodeReferences + IntoEdgeReferences,
+            G::NodeRef: NodeRef<Weight = RenderPassId>,
+        {
+            move |graph: G, node: G::NodeRef| {
+                let pass_id = node.weight();
+                let name = builder.render_pass_name(*pass_id).unwrap();
+                format!("label=\"{}\"", name)
+            }
+        }
+
+        fn resource_attributes<G>(
+            builder: &RenderGraphBuilder,
+        ) -> impl Fn(G, G::EdgeRef) -> String + '_
+        where
+            G: IntoNodeReferences + IntoEdgeReferences,
+            G::EdgeRef: EdgeRef<Weight = DependencyType>,
+        {
+            move |graph: G, edge: G::EdgeRef| match *edge.weight() {
+                DependencyType::Produce(res_id) => {
+                    let name = builder.resource_name(res_id).unwrap();
+                    format!("label=\"Produce: {}\"", name)
+                }
+
+                DependencyType::Consume(res_id) => {
+                    let name = builder.resource_name(res_id).unwrap();
+                    format!("label=\"Consume: {}\"", name)
+                }
+            }
+        }
+
+        let get_pass_attributes = pass_attributes(self);
+        let get_resource_attributes = resource_attributes(self);
+
+        let dot = petgraph::dot::Dot::with_attr_getters(
+            &graph,
+            &[dot::Config::NodeNoLabel, dot::Config::EdgeNoLabel],
+            &get_resource_attributes,
+            &get_pass_attributes,
+        );
+
+        format!("{:?}", dot)
     }
 
     pub fn build(mut self) -> Result<(), RenderGraphError> {
@@ -615,61 +678,38 @@ impl RenderGraphBuilder {
             .produced_by
             .ok_or(RenderGraphError::SwapchainNotWritten)?;
 
-        type Distance = u8;
-
         // Enqueue all render passes that introduce produce-dependencies.
-        // TODO: holodeque me
-        let mut dependencies: VecDeque<(Distance, _)> = VecDeque::new();
+        // TODO: holodeque me?
+        let mut next_depth: Vec<RenderPassId> = Vec::new();
+        let mut cur_depth: SmallSet<RenderPassId, 16> = SmallSet::new();
 
-        // Walk the graph in reverse, breadth-first. Enqueue all nodes N edges
-        // from the terminal node at once.
-        let mut init_set: SmallSet<RenderPassId, 16> = SmallSet::new();
-        init_set.insert(final_pass_id);
-        dependencies.push_back((0, init_set));
+        // Walk the graph in reverse, breadth-first. Process all nodes at depth N at once.
+        next_depth.push(final_pass_id);
 
-        let mut distance = 0;
-        while !dependencies.is_empty() {
-            let mut breadth: SmallSet<RenderPassId, 16> = SmallSet::new();
+        let start_produce_insert = Instant::now();
+        while !next_depth.is_empty() {
+            cur_depth.clear();
+            for pass_id in next_depth.drain(..) {
+                if !cur_depth.contains(&pass_id) {
+                    let pass = self.render_pass_mut(pass_id).unwrap();
+                    if pass.node_idx.is_none() {
+                        // Only consider passes that have not already been visited.
+                        cur_depth.insert(pass_id);
 
-            // Take all sets of nodes `distance` edges from the terminal node
-            // off the queue.
-            loop {
-                match dependencies.front() {
-                    None => break,
-                    Some((dist, _)) if *dist != distance => break,
-                    Some((_, ids)) => {
-                        for id in ids.iter().copied() {
-                            breadth.insert(id);
-                        }
+                        pass.node_idx = Some(graph.add_node(pass_id));
                     }
-                };
+                }
             }
 
-            // `breadth` now contains all nodes `distance` edges from the
-            // terminal node. Ensure all depended nodes are present in the
-            // graph.
-            // TODO: move this into the dequeue logic
-            breadth.retain(|&pass_id| {
-                let pass = self.render_pass_mut(pass_id).unwrap();
-
-                if pass.node_idx.is_none() {
-                    // Only retain elements which are newly added.
-                    pass.node_idx = Some(graph.add_node(pass_id));
-                    true
-                } else {
-                    false
-                }
-            });
-
-            // Insert produce-dependencies. Since entire breadths are inserted
-            // into the graph at once, this will not miss lateral edges (i.e.,
-            // edges from one N-distance node to another). Any node which does
-            // not already exist in the graph is not a dependency of the
-            // terminal node.
-            for pass_id in breadth.iter().copied() {
+            for pass_id in cur_depth.iter().copied() {
                 let pass = self.render_pass(pass_id).unwrap();
                 let pass_idx = pass.node_idx.unwrap();
 
+                // Insert produce-dependencies. Since entire depths are inserted
+                // into the graph at once, this will not miss lateral edges (i.e.,
+                // edges from one depth-N node to another). Any node at this depth
+                // which does not already exist in the graph is not a dependency of
+                // the terminal node.
                 for produce_id in pass.produces.iter().copied() {
                     let produce = self.resource(produce_id).unwrap();
 
@@ -680,23 +720,85 @@ impl RenderGraphBuilder {
                         .chain(produce.consumed_by.iter().copied())
                     {
                         let dependent = self.render_pass(dependent_id).unwrap();
-                        let dependent_idx = dependent.node_idx.unwrap();
-                        graph.add_edge(
-                            pass_idx,
-                            dependent_idx,
-                            DependencyType::Produce(produce_id),
-                        );
+                        if let Some(dependent_idx) = dependent.node_idx {
+                            // If the dependent has not been inserted, it is not
+                            // a dependency.
+                            graph.add_edge(
+                                pass_idx,
+                                dependent_idx,
+                                DependencyType::Produce(produce_id),
+                            );
+                        }
                     }
                 }
-            }
 
-            distance += 1;
+                // Enqueue next depth of the graph.
+                for input_id in pass.reads.iter().chain(pass.consumes.iter()).copied() {
+                    let input = self.resource(input_id).unwrap();
+                    let producer = input.produced_by.unwrap();
+                    next_depth.push(producer);
+                }
+            }
         }
+
+        log::debug!(
+            "Produce-dependencies inserted in {}μs",
+            start_produce_insert.elapsed().as_micros()
+        );
 
         // The graph now contains all necessary render passes and all
         // produce-dependencies between them.
 
-        todo!("consume-dependencies, etc.");
+        let start_consume_insert = Instant::now();
+        // TODO: this avoids a mutable borrow error on the graph, but it
+        // shouldn't be necessary -- no nodes are added or removed, only edges.
+        let mut passes = next_depth;
+        passes.extend(graph.node_weights().copied());
+
+        // Insert consume-dependencies.
+        // TODO: cache a list of consumers (expected to be relatively small) and
+        //   insert these dependencies to any readers of the consumed resource,
+        //   rather than scanning every read resource.
+        for pass_id in passes.iter().copied() {
+            let pass = self.render_pass(pass_id).unwrap();
+
+            for read_id in pass.reads.iter().copied() {
+                let read = self.resource(read_id).unwrap();
+
+                if let Some(consumed_by_id) = read.consumed_by {
+                    let consumed_by = self.render_pass(consumed_by_id).unwrap();
+                    graph.add_edge(
+                        pass.node_idx.unwrap(),
+                        consumed_by.node_idx.unwrap(),
+                        DependencyType::Consume(read_id),
+                    );
+                }
+            }
+        }
+
+        log::debug!(
+            "Consume-dependencies inserted in {}μs",
+            start_consume_insert.elapsed().as_micros()
+        );
+
+        println!("{}", self.gen_dotgraph(&graph));
+
+        let start_dep_resolve = Instant::now();
+        let ordered = match petgraph::algo::toposort(&graph, None) {
+            Ok(o) => o,
+            Err(cycle) => {
+                let pass_id = *graph.node_weight(cycle.node_id()).unwrap();
+                return Err(RenderGraphError::DependencyCycle {
+                    pass_name: self.render_pass_name(pass_id).unwrap().into(),
+                });
+            }
+        };
+        log::debug!(
+            "Dependencies resolved in {}μs",
+            start_dep_resolve.elapsed().as_micros()
+        );
+
+        todo!("physical resource assignment");
     }
 }
 

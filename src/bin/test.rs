@@ -28,10 +28,10 @@ impl RenderPass for TrianglePass {
 fn build_graph() {
     let mut graph = RenderGraphBuilder::new();
 
-    let mut tri = graph.add_render_pass("triangle", TrianglePass);
-    let color_out = tri
+    let mut pass_a = graph.add_render_pass("pass A", TrianglePass);
+    let a_out = pass_a
         .add_color_attachment(
-            "triangle color attachment",
+            "pass A color",
             ImageInfo {
                 size: ImageSize::SAME_AS_SWAPCHAIN,
                 format: vk::Format::B8G8R8A8_SRGB,
@@ -39,13 +39,46 @@ fn build_graph() {
             None,
         )
         .unwrap();
-    tri.finish();
+    pass_a.finish();
+
+    let mut pass_b = graph.add_render_pass("pass B", TrianglePass);
+    pass_b.add_input_attachment(a_out).unwrap();
+    let b_out = pass_b
+        .add_color_attachment(
+            "pass B color",
+            ImageInfo {
+                size: ImageSize::SAME_AS_SWAPCHAIN,
+                format: vk::Format::B8G8R8A8_SRGB,
+            },
+            None,
+        )
+        .unwrap();
+    pass_b.finish();
+
+    let mut pass_c = graph.add_render_pass("pass C", TrianglePass);
+    pass_c.add_input_attachment(b_out).unwrap();
+    let c_out = pass_c
+        .add_color_attachment(
+            "pass C color",
+            ImageInfo {
+                size: ImageSize::SAME_AS_SWAPCHAIN,
+                format: vk::Format::B8G8R8A8_SRGB,
+            },
+            Some(a_out),
+        )
+        .unwrap();
+    pass_c.finish();
+
+    graph.set_final_image(c_out).unwrap();
+    graph.build().unwrap();
 
     todo!();
 }
 
 pub fn main() {
     env_logger::init();
+
+    build_graph();
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();

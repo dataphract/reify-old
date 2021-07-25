@@ -73,6 +73,13 @@ where
         matches!(self, SmallSet::Heap(_))
     }
 
+    pub fn clear(&mut self) {
+        match self {
+            SmallSet::Inline(s) => s.clear(),
+            SmallSet::Heap(s) => s.clear(),
+        }
+    }
+
     pub fn reserve(&mut self, additional: usize) {
         match self {
             SmallSet::Inline(v) => {
@@ -111,7 +118,7 @@ where
         match self {
             SmallSet::Inline(ref mut s) => {
                 if s.contains(&item) {
-                    return true;
+                    return false;
                 }
 
                 if let Err(item) = s.try_push(item) {
@@ -120,7 +127,7 @@ where
                     *self = SmallSet::Heap(set);
                 }
 
-                false
+                true
             }
             SmallSet::Heap(s) => s.insert(item),
         }
