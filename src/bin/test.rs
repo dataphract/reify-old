@@ -4,7 +4,7 @@ use erupt::vk;
 use raw_window_handle::HasRawWindowHandle;
 use reify::{
     graph::{ClearColorValue, ImageInfo, ImageSize, RenderGraphBuilder, RenderPass},
-    Instance,
+    Instance, MemoryConfig,
 };
 use shaderc::{Compiler, ShaderKind};
 use winit::{
@@ -78,8 +78,6 @@ fn build_graph() {
 pub fn main() {
     env_logger::init();
 
-    build_graph();
-
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
@@ -87,7 +85,13 @@ pub fn main() {
     let _debug_messenger = instance.create_debug_messenger();
     let surface = instance.create_surface(window.raw_window_handle());
     let phys_device = match instance
-        .enumerate_physical_devices(&surface)
+        .enumerate_physical_devices(
+            &surface,
+            MemoryConfig {
+                min_host_memory: 128 * 1024 * 1024,
+                min_device_memory: 128 * 1024 * 1024,
+            },
+        )
         .into_iter()
         .find(|_phys| true)
     {
@@ -106,6 +110,9 @@ pub fn main() {
             },
         )
     };
+
+    let mem_types = phys_device.memory_types();
+    println!("Memory types: {:#?}", mem_types);
 
     let mut compiler = Compiler::new().expect("failed to initialize shaderc");
 

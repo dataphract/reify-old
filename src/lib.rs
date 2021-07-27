@@ -4,6 +4,7 @@
 mod debug_utils;
 mod display;
 pub mod graph;
+mod mem;
 mod shader;
 mod util;
 pub mod vks;
@@ -22,6 +23,7 @@ use thread_local::ThreadLocal;
 
 pub use debug_utils::DebugMessenger;
 pub use display::Display;
+pub use mem::{MemoryConfig, MemoryTypes};
 
 const LAYER_NAME_VALIDATION: &[u8] = b"VK_LAYER_KHRONOS_validation\0";
 
@@ -295,7 +297,11 @@ impl Instance {
         compile_error!("Unsupported platform (only linux is supported).");
     }
 
-    pub fn enumerate_physical_devices(&self, surface: &vks::SurfaceKHR) -> Vec<PhysicalDevice> {
+    pub fn enumerate_physical_devices(
+        &self,
+        surface: &vks::SurfaceKHR,
+        memory_config: MemoryConfig,
+    ) -> Vec<PhysicalDevice> {
         let read_lock = self.inner.read();
 
         let devices = match read_lock.handle.enumerate_physical_devices() {
@@ -312,7 +318,7 @@ impl Instance {
             .into_iter()
             .map(|raw| {
                 // Safety: Physical device handle comes from the correct instance.
-                unsafe { PhysicalDevice::new(self.clone(), raw, surface) }
+                unsafe { PhysicalDevice::new(self.clone(), raw, surface, memory_config) }
             })
             .collect()
     }
@@ -327,6 +333,8 @@ pub struct PhysicalDeviceInner {
     graphics_queue_family: u32,
     transfer_queue_family: u32,
     present_queue_family: u32,
+
+    memory_types: MemoryTypes,
 }
 
 fn is_dedicated_transfer(props: &vk::QueueFamilyProperties) -> bool {
@@ -357,11 +365,12 @@ impl PhysicalDevice {
         instance: Instance,
         phys_device: vks::PhysicalDevice,
         surface: &vks::SurfaceKHR,
+        memory_config: MemoryConfig,
     ) -> PhysicalDevice {
-        let read_lock = instance.inner.read();
+        let instance_read = instance.inner.read();
 
         let queue_families = unsafe {
-            read_lock
+            instance_read
                 .handle
                 .get_physical_device_queue_family_properties(&phys_device)
         };
@@ -418,7 +427,7 @@ impl PhysicalDevice {
             // - Queue family index provided by physical device.
             // - No external synchronization requirement.
             if unsafe {
-                read_lock
+                instance_read
                     .handle()
                     .get_physical_device_surface_support_khr(&phys_device, index as u32, &surface)
                     .expect(&format!(
@@ -430,7 +439,14 @@ impl PhysicalDevice {
             }
         }
 
-        drop(read_lock);
+        let memory_properties: mem::PhysicalDeviceMemoryProperties = instance_read
+            .handle()
+            .get_physical_device_memory_properties(&phys_device)
+            .into();
+
+        let memory_types = memory_properties.select_memory_types(memory_config);
+
+        drop(instance_read);
 
         let graphics_queue_family = match graphics_queue {
             Some(QueueSelection::Dedicated(d)) => {
@@ -478,6 +494,7 @@ impl PhysicalDevice {
                 graphics_queue_family,
                 transfer_queue_family,
                 present_queue_family,
+                memory_types,
             }),
         }
     }
@@ -502,6 +519,10 @@ impl PhysicalDevice {
                 .handle
                 .get_physical_device_features(&self.inner.raw)
         }
+    }
+
+    pub fn memory_types(&self) -> mem::MemoryTypes {
+        self.inner.memory_types
     }
 
     pub fn create_device(&self) -> Device {
@@ -761,6 +782,10 @@ pub struct Device {
 impl Device {
     pub fn read_inner(&self) -> RwLockReadGuard<'_, DeviceInner> {
         self.inner.read()
+    }
+
+    pub fn physical_device(&self) -> PhysicalDevice {
+        self.inner.read().phys_device.clone()
     }
 
     pub fn graphics_queue(&self) -> Queue {

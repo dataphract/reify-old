@@ -257,7 +257,19 @@ impl Instance {
         }
     }
 
-    /// Queries is presentation is supported.
+    /// Reports memory information for the specified physical device.
+    #[inline]
+    pub fn get_physical_device_memory_properties(
+        &self,
+        phys_device: &PhysicalDevice,
+    ) -> vk::PhysicalDeviceMemoryProperties {
+        unsafe {
+            self.loader
+                .get_physical_device_memory_properties(*phys_device.handle())
+        }
+    }
+
+    /// Queries if presentation is supported.
     ///
     /// # Safety
     ///
