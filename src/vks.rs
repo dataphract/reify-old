@@ -1016,6 +1016,26 @@ impl Device {
 
     // ------------------------------------------------------------------------
 
+    pub unsafe fn allocate_memory(
+        &self,
+        allocate_info: &vk::MemoryAllocateInfo,
+    ) -> VkResult<DeviceMemory> {
+        unsafe {
+            self.loader
+                .allocate_memory(allocate_info, None)
+                .result()
+                .map(|m| DeviceMemory::new(m))
+        }
+    }
+
+    pub unsafe fn free_memory(&self, mut memory: DeviceMemory) {
+        unsafe {
+            self.loader.free_memory(Some(*memory.handle_mut()), None);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
     /// Creates a swapchain.
     ///
     /// # Safety
@@ -1441,6 +1461,13 @@ impl<'a> ImageMemoryBarrierBuilder<'a> {
         self.inner = self.inner.image(unsafe { *image.handle() });
         self
     }
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan device memory object.
+    pub struct DeviceMemory(vk::DeviceMemory);
 }
 
 // ============================================================================

@@ -1,4 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![feature(drain_filter)]
+#![feature(int_log)]
 #![feature(once_cell)]
 
 mod debug_utils;
