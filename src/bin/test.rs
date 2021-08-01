@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use erupt::vk;
 use raw_window_handle::HasRawWindowHandle;
 use reify::{
-    graph::{ClearColorValue, ImageInfo, ImageSize, RenderGraphBuilder, RenderPass},
+    graph::{ImageInfo, ImageSize, RenderGraphBuilder},
+    pass::{ClearColorValue, RenderPass},
     Instance, MemoryConfig,
 };
 use shaderc::{Compiler, ShaderKind};
@@ -21,6 +22,12 @@ impl RenderPass for TrianglePass {
     }
 
     fn record(&self, device: &reify::vks::Device, cmdbuf: &mut reify::vks::CommandBuffer) {
+        // Render pass and subpass already started, barriers issued, etc.
+
+        unsafe {
+            device.cmd_bind_pipeline(cmdbuf, vk::PipelineBindPoint::GRAPHICS, todo!());
+            device.cmd_draw(cmdbuf, 3, 1, 0, 0);
+        }
         todo!()
     }
 }
@@ -70,7 +77,7 @@ fn build_graph() {
     pass_c.finish();
 
     graph.set_final_image(c_out).unwrap();
-    graph.build().unwrap();
+    // graph.build().unwrap();
 
     todo!();
 }

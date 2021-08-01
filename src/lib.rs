@@ -5,8 +5,10 @@
 
 mod debug_utils;
 mod display;
+mod frame;
 pub mod graph;
 mod mem;
+pub mod pass;
 mod shader;
 mod util;
 pub mod vks;

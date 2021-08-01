@@ -1,4 +1,4 @@
-use std::{cmp, collections::HashSet, fmt, hash::Hash, iter::FromIterator, mem};
+use std::{cmp, collections::HashSet, fmt, hash::Hash, iter::FromIterator, mem, ops::Range};
 
 use arrayvec::ArrayVec;
 
@@ -58,10 +58,19 @@ where
         SmallSet::Inline(ArrayVec::new())
     }
 
+    /// Returns the number of elements the set can hold without reallocating.
     pub fn capacity(&self) -> usize {
         match self {
             SmallSet::Inline(_) => CAP,
             SmallSet::Heap(s) => s.capacity(),
+        }
+    }
+
+    /// Returns `true` if the set contains no elements.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            SmallSet::Inline(s) => s.is_empty(),
+            SmallSet::Heap(s) => s.is_empty(),
         }
     }
 
@@ -140,6 +149,13 @@ where
         }
     }
 
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        match self {
+            SmallSet::Inline(s) => SmallSetDrain::Inline(s.drain(..)),
+            SmallSet::Heap(s) => SmallSetDrain::Heap(s.drain()),
+        }
+    }
+
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&T) -> bool,
@@ -172,6 +188,29 @@ impl<'a, T> Iterator for SmallSetIter<'a, T> {
         match self {
             SmallSetIter::Inline(it) => it.size_hint(),
             SmallSetIter::Heap(it) => it.size_hint(),
+        }
+    }
+}
+
+pub enum SmallSetDrain<'a, T, const CAP: usize> {
+    Inline(arrayvec::Drain<'a, T, CAP>),
+    Heap(std::collections::hash_set::Drain<'a, T>),
+}
+
+impl<'a, T, const CAP: usize> Iterator for SmallSetDrain<'a, T, CAP> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            SmallSetDrain::Inline(it) => it.next(),
+            SmallSetDrain::Heap(it) => it.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            SmallSetDrain::Inline(it) => it.size_hint(),
+            SmallSetDrain::Heap(it) => it.size_hint(),
         }
     }
 }

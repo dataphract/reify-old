@@ -62,6 +62,15 @@ pub unsafe trait VkObject {
     ///   uphold Vulkan's external synchronization rules until the copy is
     ///   dropped.
     unsafe fn handle_mut(&mut self) -> &mut Self::Handle;
+
+    /// Takes the raw handle out, leaving a null handle.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the following invariants:
+    /// - After calling this method, the value may not be used as a parameter to
+    ///   any Vulkan API call.
+    unsafe fn take(&mut self) -> Self;
 }
 
 /// A macro to define a wrapper type around a raw Vulkan handle and implement
@@ -78,12 +87,21 @@ macro_rules! define_handle {
 
             #[inline(always)]
             unsafe fn handle(&self) -> &Self::Handle {
+                assert!(!self.raw.is_null());
                 &self.raw
             }
 
             #[inline(always)]
             unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
+                assert!(!self.raw.is_null());
                 &mut self.raw
+            }
+
+            #[inline(always)]
+            unsafe fn take(&mut self) -> Self {
+                let raw = self.raw;
+                self.raw = <$raw>::null();
+                Self { raw }
             }
         }
 
@@ -177,6 +195,10 @@ unsafe impl VkObject for Instance {
 
     unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
         &mut self.loader
+    }
+
+    unsafe fn take(&mut self) -> Self {
+        unimplemented!()
     }
 }
 
@@ -478,6 +500,10 @@ unsafe impl VkObject for Device {
     unsafe fn handle_mut(&mut self) -> &mut Self::Handle {
         &mut self.loader
     }
+
+    unsafe fn take(&mut self) -> Self {
+        unimplemented!()
+    }
 }
 
 impl Device {
@@ -768,6 +794,18 @@ impl Device {
         }
     }
 
+    pub unsafe fn reset_command_pool(
+        &self,
+        command_pool: &mut CommandPool,
+        flags: vk::CommandPoolResetFlags,
+    ) -> VkResult<()> {
+        unsafe {
+            self.loader
+                .reset_command_pool(*command_pool.handle_mut(), Some(flags))
+                .result()
+        }
+    }
+
     // ------------------------------------------------------------------------
 
     /// Allocates command buffers from an existing command pool.
@@ -1012,6 +1050,30 @@ impl Device {
             self.loader
                 .destroy_semaphore(Some(*semaphore.handle_mut()), None);
         }
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub unsafe fn create_event(
+        &self,
+        create_info: &vk::EventCreateInfoBuilder<'_>,
+    ) -> VkResult<Event> {
+        unsafe {
+            self.loader
+                .create_event(create_info, None)
+                .result()
+                .map(|s| Event::new(s))
+        }
+    }
+
+    pub unsafe fn destroy_event(&self, mut event: Event) {
+        unsafe {
+            self.loader.destroy_event(Some(*event.handle_mut()), None);
+        }
+    }
+
+    pub unsafe fn reset_event(&self, event: &mut Event) -> VkResult<()> {
+        unsafe { self.loader.reset_event(*event.handle_mut()).result() }
     }
 
     // ------------------------------------------------------------------------
@@ -1436,6 +1498,19 @@ impl FenceWaitStatus {
 define_handle! {
     /// An opaque handle to a Vulkan semaphore object.
     pub struct Semaphore(vk::Semaphore);
+}
+
+// ============================================================================
+
+define_handle! {
+    /// An opaque handle to a Vulkan event object.
+    pub struct Event(vk::Event);
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EventStatus {
+    Unsignaled,
+    Signaled,
 }
 
 // ============================================================================

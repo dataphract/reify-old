@@ -18,7 +18,12 @@ use petgraph::{
 use thiserror::Error;
 use tinyvec::TinyVec;
 
-use crate::{util::SmallSet, vks};
+use crate::{
+    frame::FrameContext,
+    pass::{ClearColorValue, ClearDepthStencilValue, RenderPass},
+    util::SmallSet,
+    vks,
+};
 
 type PassGraph = petgraph::Graph<RenderPassId, DependencyType, Directed, u16>;
 
@@ -652,7 +657,7 @@ impl RenderGraphBuilder {
         format!("{:?}", dot)
     }
 
-    pub fn build(mut self) -> Result<(), RenderGraphError> {
+    pub fn build(mut self, frame: &mut FrameContext) -> Result<(), RenderGraphError> {
         let final_image_id = self
             .final_image
             .clone()
@@ -664,9 +669,9 @@ impl RenderGraphBuilder {
         // - Each node is a render pass.
         // - Each edge is a resource dependency. There are two kinds of dependency:
         //   - Produce-dependencies, in which pass A produces resource R and
-        //     pass B reads or consumes R. This requires both an execution
-        //     barrier, to ensure A happens-before B, and a memory barrier to
-        //     ensure the data written by A is made visible.
+        //     pass B reads or consumes R. This requires a memory barrier
+        //     to ensure A happens-before B and to ensure the data written by A
+        //     is made visible.
         //   - Consume-dependencies, in which pass A reads resource R and pass B
         //     consumes R. This only requires an execution barrier to ensure A
         //     happens-before B (write-after-read hazards are precluded by
@@ -679,8 +684,7 @@ impl RenderGraphBuilder {
             .ok_or(RenderGraphError::SwapchainNotWritten)?;
 
         // Enqueue all render passes that introduce produce-dependencies.
-        // TODO: holodeque me?
-        let mut next_depth: Vec<RenderPassId> = Vec::new();
+        let mut next_depth: TinyVec<[RenderPassId; 8]> = TinyVec::new();
         let mut cur_depth: SmallSet<RenderPassId, 16> = SmallSet::new();
 
         // Walk the graph in reverse, breadth-first. Process all nodes at depth N at once.
@@ -688,7 +692,8 @@ impl RenderGraphBuilder {
 
         let start_produce_insert = Instant::now();
         while !next_depth.is_empty() {
-            cur_depth.clear();
+            assert!(cur_depth.is_empty());
+
             for pass_id in next_depth.drain(..) {
                 if !cur_depth.contains(&pass_id) {
                     let pass = self.render_pass_mut(pass_id).unwrap();
@@ -701,7 +706,7 @@ impl RenderGraphBuilder {
                 }
             }
 
-            for pass_id in cur_depth.iter().copied() {
+            for pass_id in cur_depth.drain() {
                 let pass = self.render_pass(pass_id).unwrap();
                 let pass_idx = pass.node_idx.unwrap();
 
@@ -799,82 +804,55 @@ impl RenderGraphBuilder {
         );
 
         todo!("physical resource assignment");
+
+        // Maintain a mapping from virtual resources to physical resources.
+        let mut virt_to_phys: Vec<Option<PhysResourceId>> =
+            Vec::with_capacity(self.resources.len());
+        virt_to_phys.resize(self.resources.len(), None);
+
+        for pass_id in ordered.iter().map(|&idx| *graph.node_weight(idx).unwrap()) {
+            let pass = self.render_pass(pass_id).unwrap();
+            let pass_complete_event = frame.alloc_event();
+
+            // Input attachments have already been acquired from the frame context.
+            for in_att in pass.input_attachments.iter().copied() {
+                let phys_id = virt_to_phys[in_att.id as usize].unwrap();
+            }
+
+            for col_att in pass.color_attachments.iter() {
+                let phys_id = match col_att.consumed {
+                    Some(old_id) => virt_to_phys[old_id.id as usize]
+                        .take()
+                        .expect("consumed virtual resource has no associated physical resource"),
+                    None => todo!("acquire from frame context"),
+                };
+            }
+        }
+
+        todo!();
     }
 }
 
 // =============================================================================
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum ClearColorValue {
-    Float32([f32; 4]),
-    Int32([i32; 4]),
-    Uint32([u32; 4]),
+enum ImageType {}
+
+struct ResourcePool {}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PhysResourceId {
+    id: u16,
 }
 
-impl From<[f32; 4]> for ClearColorValue {
-    fn from(f: [f32; 4]) -> Self {
-        ClearColorValue::Float32(f)
+impl ResourcePool {
+    fn acquire(&mut self) -> PhysResourceId {
+        todo!()
     }
-}
 
-impl From<[i32; 4]> for ClearColorValue {
-    fn from(i: [i32; 4]) -> Self {
-        ClearColorValue::Int32(i)
-    }
-}
-
-impl From<[u32; 4]> for ClearColorValue {
-    fn from(u: [u32; 4]) -> Self {
-        ClearColorValue::Uint32(u)
-    }
-}
-
-impl From<ClearColorValue> for vk::ClearColorValue {
-    fn from(val: ClearColorValue) -> Self {
-        use ClearColorValue::*;
-
-        match val {
-            Float32(f) => vk::ClearColorValue { float32: f },
-            Int32(i) => vk::ClearColorValue { int32: i },
-            Uint32(u) => vk::ClearColorValue { uint32: u },
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct ClearDepthStencilValue {
-    depth: f32,
-    stencil: u32,
-}
-
-impl From<ClearDepthStencilValue> for vk::ClearDepthStencilValue {
-    fn from(val: ClearDepthStencilValue) -> Self {
-        vk::ClearDepthStencilValue {
-            depth: val.depth,
-            stencil: val.stencil,
-        }
-    }
+    fn release(&mut self) -> () {}
 }
 
 // =============================================================================
-
-pub trait RenderPass {
-    /// Returns the value used to clear color attachments.
-    ///
-    /// If `None`, then the initial contents of the attachment are undefined.
-    fn clear_color_value(&self) -> Option<ClearColorValue> {
-        None
-    }
-
-    /// Returns the value used to clear depth/stencil attachments.
-    ///
-    /// If `None`, then the initial contents of the attachment are undefined.
-    fn clear_depth_stencil_value(&self) -> Option<ClearDepthStencilValue> {
-        None
-    }
-
-    fn record(&self, device: &vks::Device, cmdbuf: &mut vks::CommandBuffer);
-}
 
 #[cfg(test)]
 mod tests {
@@ -918,18 +896,5 @@ mod tests {
 
         let res = graph.resource(color_attachment).unwrap();
         assert_eq!(res.produced_by, Some(pass));
-    }
-
-    #[test]
-    fn basic() {
-        let mut graph = RenderGraphBuilder::new();
-
-        let mut pass = graph.add_render_pass("main pass", DummyPass);
-        let color_attachment = pass
-            .add_color_attachment("color attachment", DUMMY_COLOR, None)
-            .unwrap();
-        pass.finish();
-
-        todo!();
     }
 }
