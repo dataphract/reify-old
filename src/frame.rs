@@ -5,10 +5,20 @@ use tinyvec::TinyVec;
 
 use crate::vks::{self, VkObject};
 
+/// An event used to synchronize resource accesses which happen-after a read.
+#[derive(Default)]
+pub struct ReadEvent {
+    /// The ID of the event used to synchronize the read.
+    event_id: FrameEventId,
+    /// The stage mask of the read.
+    stage_mask: vk::PipelineStageFlagBits,
+    /// The access mask of the read.
+    access_mask: vk::AccessFlagBits,
+}
+
 /// The synchronization state of a resource during recording.
 ///
-/// In order to read the resource, a render pass must:
-/// - Record in `read_event_ids` the ID of an event which will be signaled
+/// In order to read the resource, a render pass must:record in `read_event_ids` the ID of an event which will be signaled
 ///   *after* the render pass has finished reading the resource.
 /// - Ensure both of the following:
 ///   - `read_stage_mask` contains the pipeline stage flags indicating the
@@ -24,13 +34,14 @@ use crate::vks::{self, VkObject};
 /// - Record an event signal operation for the event added to `read_event_ids`.
 ///
 /// In order to write the resource, a render pass must:
-/// - Record an event wait operation for each event specified in
-///   `read_event_ids` with a memory dependency from
-///   `write_stage_mask | read_stage_mask` and
-///   `write_access_mask | read_access_mask` to the stage and access masks of
-///   the intended write.
+/// - Record an event wait operation for each event specified in `read_events`.
+///   Each event wait operation must define a memory dependency such that:
+///   - `srcStageMask` is a union of `write_stage_mask` and `event.stage_mask`
+///   - `srcAccessMask` is a union of `write_access_mask` and `event.access_mask`
+///   - `dstStageMask` and `dstAccessMask` are masks suitable for the indended
+///     write.
 /// - Record the contents of the render pass.
-/// - Clear `read_event_ids`, `read_stage_mask` and `read_access_mask`.
+/// - Clear `read_events`.
 /// - Set `write_stage_mask` and `write_access_mask` to the relevant values for
 ///   the render pass.
 pub struct ResourceSyncState {
@@ -38,25 +49,20 @@ pub struct ResourceSyncState {
     write_stage_mask: vk::PipelineStageFlagBits,
     /// The access mask of the most recent write.
     write_access_mask: vk::AccessFlagBits,
-
-    /// The event IDs of all render passes that have read from this resource
-    /// since the most recent write.
-    // TODO: Events can be per-resource-read, rather than per-pass. This would
-    // prevent an event wait operation from having to wait for an entire render
-    // pass to complete; it could instead only wait for the relevant set of
-    // pipeline stages.
-    read_event_ids: TinyVec<[u16; 8]>,
-    /// The stage mask of all reads that have occurred since the most recent
-    /// write.
-    read_stage_mask: vk::PipelineStageFlagBits,
-    /// The access mask of all reads that have occurred since the most recent
-    /// write.
-    read_access_mask: vk::AccessFlagBits,
+    /// The list of read events which have accessed this resource since the most
+    /// recent write.
+    read_events: TinyVec<[ReadEvent; 8]>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FrameEventId {
     id: u16,
+}
+
+impl Default for FrameEventId {
+    fn default() -> Self {
+        FrameEventId { id: u16::MAX }
+    }
 }
 
 pub struct FrameEvents {
